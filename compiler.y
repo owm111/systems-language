@@ -8,6 +8,11 @@ Feature ideas:
 - functions return nples
 - loops can have multiple exits
 
+Improvments:
+- implement hash table as a symbol table (but then how does scoping work?)
+- fix space leaks (there have to be some)
+- type names are really annoying as-is...
+
 References:
 - https://llvm.org/docs/LangRef.html
 - https://redirect.cs.umbc.edu/courses/331/papers/lexyacc.pdf
@@ -20,6 +25,14 @@ References:
 
 #include "header.h"
 
+extern int yylineno;
+extern int yyerror(const char *restrict msg);
+
+/* single counter for giving unique names to everything */
+int varctr;
+
+/* symbol table */
+
 struct symbol {
 	char *id; /* actual name in user code */
 	int n; /* unique identifier to avoid capturing */
@@ -27,24 +40,65 @@ struct symbol {
 	struct symbol *next;
 };
 
+/* currently implemented as an alist */
+static struct symbol *symbols;
+
+/* create a new scope (this pushes a symbol NULL to the list) */
+static void pushscope(void);
+/* delete the last scope (this pops everything until the next NULL) */
+static void popscope(void);
+/* add a symbol to the list and return a unique identifier */
+static int pushsymbol(char *id, enum type t);
+/* return a pointer to the symbol, or NULL if it does not exist */
+static struct symbol *symbolinfo(char *id);
+
+/* list of functions */
+
 struct function {
 	char *name;
 	enum type result, param;
 	struct function *next;
 };
 
-extern int yyerror(const char *restrict msg);
-extern void pushscope(void);
-extern void type2str(char *buf, enum type t);
-extern void popscope(void);
-extern int pushsymbol(char *id, enum type t);
-extern struct symbol *symbolinfo(char *id);
+/* currently implemented as an alist */
+static struct function *functionlist;
+
+/* add a function */
 static void pushfunction(char *name, enum type result, enum type param);
+/* look up a function */
 static struct function *functioninfo(char *name);
-static int isunsigned(enum type t);
-static int isfloat(enum type t);
+
+/* stack of labels */
+
+/* this is needed to save labels for conditionals, loops, etc. between
+actions */
+
+/* only stores the number in the label's name */
+struct labelnode {
+	int n;
+	struct labelnode *next;
+};
+
+/* currently implemented as a linked list */
+static struct labelnode *labelstack;
+
 static void pushlabel(int);
 static int poplabel(void);
+
+/* utilities for working with types */
+
+/* write the name of the llvm type to the buffer */
+extern void type2str(char *buf, enum type t);
+
+/* is this an unsigned, integral type? */
+static int isunsigned(enum type t);
+/* is this a floating-point, numeric type? */
+static int isfloat(enum type t);
+
+/* generating code */
+
+static void cast(struct expressionresult *r, struct expressionresult s,
+		enum type desttyp);
 static void arithbinop(const char *signedinstr, const char *unsignedinstr,
 		const char *floatinstr, struct expressionresult *r,
 		struct expressionresult s, struct expressionresult t);
@@ -57,53 +111,6 @@ static void beginloop(void);
 static void middleloop(struct expressionresult cond);
 static void endloop(void);
 
-extern int yylineno;
-int varctr;
-struct symbol *symbols = NULL;
-const char *casttable[LAST_TYPE /* from */][LAST_TYPE /* to */] = {
-	[U1T] = {
-		[U1T] = "bitcast",
-		[I32T] = "zext", [I64T] = "zext",
-		[U32T] = "zext", [U64T] = "zext",
-		[F32T] = "uitofp", [F64T] = "uitofp",
-	},
-	[I32T] = {
-		[U1T] = "trunc",
-		[I32T] = "bitcast", [I64T] = "sext",
-		[U32T] = "bitcast", [U64T] = "zext",
-		[F32T] = "sitofp", [F64T] = "sitofp",
-	},
-	[I64T] = {
-		[U1T] = "trunc",
-		[I32T] = "trunc", [I64T] = "bitcast",
-		[U32T] = "trunc", [U64T] = "bitcast",
-		[F32T] = "sitofp", [F64T] = "sitofp",
-	},
-	[U32T] = {
-		[U1T] = "trunc",
-		[I32T] = "bitcast", [I64T] = "sext",
-		[U32T] = "bitcast", [U64T] = "zext",
-		[F32T] = "uitofp", [F64T] = "uitofp",
-	},
-	[U64T] = {
-		[U1T] = "trunc",
-		[I32T] = "trunc", [I64T] = "bitcast",
-		[U32T] = "trunc", [U64T] = "bitcast",
-		[F32T] = "uitofp", [F64T] = "uitofp",
-	},
-	[F32T] = {
-		[U1T] = "fptoui",
-		[I32T] = "fptosi", [I64T] = "fptosi",
-		[U32T] = "fptoui", [U64T] = "fptoui",
-		[F32T] = "bitcast", [F64T] = "fpext",
-	},
-	[F64T] = {
-		[U1T] = "fptoui",
-		[I32T] = "fptosi", [I64T] = "fptosi",
-		[U32T] = "fptoui", [U64T] = "fptoui",
-		[F32T] = "fptrunc", [F64T] = "bitcast",
-	},
-};
 %}
 
 %union {
@@ -172,18 +179,7 @@ expression_0 : CONSTANT {
 	printf("\t%%tmp%d = add i64 %lu, 0\n", $$.var, $1);
 }
 
-expression_0 : CAST '(' expression ',' typename ')' {
-	char tbuf1[64], tbuf2[64];
-	const char *cast;
-
-	$$.var = varctr++;
-	$$.t = $5;
-	cast = casttable[$3.t][$5];
-	type2str(tbuf1, $3.t);
-	type2str(tbuf2, $5);
-	printf("\t%%tmp%d = %s %s %%tmp%d to %s\n",
-			$$.var, cast, tbuf1, $3.var, tbuf2);
-}
+expression_0 : CAST '(' expression ',' typename ')' {cast(&$$, $3, $5);}
 
 expression_0 : IDENTIFIER '(' expression ')' {
 	struct function *node;
@@ -401,8 +397,6 @@ symbolinfo(char *id)
 	return NULL;
 }
 
-static struct function *functionlist;
-
 void
 pushfunction(char *name, enum type result, enum type param)
 {
@@ -462,13 +456,6 @@ binop(const char *restrict instr, YYSTYPE r, YYSTYPE s, YYSTYPE t)
 			s.expression.var, t.expression.var);
 }
 
-struct labelnode {
-	int n;
-	struct labelnode *next;
-};
-
-static struct labelnode *labelstack;
-
 void
 pushlabel(int n)
 {
@@ -493,6 +480,67 @@ poplabel(void)
 	labelstack = l->next;
 	free(l);
 	return n;
+}
+
+void
+cast(struct expressionresult *r, struct expressionresult s,
+		enum type desttyp)
+{
+	/* converting between numeric types */
+	static const char *casttable[LAST_TYPE /* from */][LAST_TYPE /* to */] = {
+		[U1T] = {
+			[U1T] = "bitcast",
+			[I32T] = "zext", [I64T] = "zext",
+			[U32T] = "zext", [U64T] = "zext",
+			[F32T] = "uitofp", [F64T] = "uitofp",
+		},
+		[I32T] = {
+			[U1T] = "trunc",
+			[I32T] = "bitcast", [I64T] = "sext",
+			[U32T] = "bitcast", [U64T] = "zext",
+			[F32T] = "sitofp", [F64T] = "sitofp",
+		},
+		[I64T] = {
+			[U1T] = "trunc",
+			[I32T] = "trunc", [I64T] = "bitcast",
+			[U32T] = "trunc", [U64T] = "bitcast",
+			[F32T] = "sitofp", [F64T] = "sitofp",
+		},
+		[U32T] = {
+			[U1T] = "trunc",
+			[I32T] = "bitcast", [I64T] = "sext",
+			[U32T] = "bitcast", [U64T] = "zext",
+			[F32T] = "uitofp", [F64T] = "uitofp",
+		},
+		[U64T] = {
+			[U1T] = "trunc",
+			[I32T] = "trunc", [I64T] = "bitcast",
+			[U32T] = "trunc", [U64T] = "bitcast",
+			[F32T] = "uitofp", [F64T] = "uitofp",
+		},
+		[F32T] = {
+			[U1T] = "fptoui",
+			[I32T] = "fptosi", [I64T] = "fptosi",
+			[U32T] = "fptoui", [U64T] = "fptoui",
+			[F32T] = "bitcast", [F64T] = "fpext",
+		},
+		[F64T] = {
+			[U1T] = "fptoui",
+			[I32T] = "fptosi", [I64T] = "fptosi",
+			[U32T] = "fptoui", [U64T] = "fptoui",
+			[F32T] = "fptrunc", [F64T] = "bitcast",
+		},
+	};
+	const char *cast;
+	char tbuf1[64], tbuf2[64];
+
+	r->var = varctr++;
+	r->t = desttyp;
+	cast = casttable[s.t][desttyp];
+	type2str(tbuf1, s.t);
+	type2str(tbuf2, desttyp);
+	printf("\t%%tmp%d = %s %s %%tmp%d to %s\n",
+			r->var, cast, tbuf1, s.var, tbuf2);
 }
 
 void
