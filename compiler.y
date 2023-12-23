@@ -5,7 +5,7 @@ Current problems:
 - casting to/from booleans: should it be "smart?"
 
 Feature ideas:
-- functions return tuples
+- functions return nples
 - loops can have multiple exits
 
 References:
@@ -27,12 +27,20 @@ struct symbol {
 	struct symbol *next;
 };
 
+struct function {
+	char *name;
+	enum type result, param;
+	struct function *next;
+};
+
 extern int yyerror(const char *restrict msg);
 extern void pushscope(void);
 extern void type2str(char *buf, enum type t);
 extern void popscope(void);
 extern int pushsymbol(char *id, enum type t);
 extern struct symbol *symbolinfo(char *id);
+static void pushfunction(char *name, enum type result, enum type param);
+static struct function *functioninfo(char *name);
 static int isunsigned(enum type t);
 static int isfloat(enum type t);
 static void pushlabel(int);
@@ -109,7 +117,8 @@ const char *casttable[LAST_TYPE /* from */][LAST_TYPE /* to */] = {
 
 %token <identifier> IDENTIFIER
 %token <constant> CONSTANT
-%token U1 I32 I64 U32 U64 F32 F64
+/* types */
+%token U0 U1 I32 I64 U32 U64 F32 F64
 /* expressions */
 %token CAST
 /* statements */
@@ -174,6 +183,25 @@ expression_0 : CAST '(' expression ',' typename ')' {
 	type2str(tbuf2, $5);
 	printf("\t%%tmp%d = %s %s %%tmp%d to %s\n",
 			$$.var, cast, tbuf1, $3.var, tbuf2);
+}
+
+expression_0 : IDENTIFIER '(' expression ')' {
+	struct function *node;
+	char tbuf1[64], tbuf2[64];
+
+	node = functioninfo($1);
+	if (node == NULL) {
+		yyerror("undeclared function");
+	}
+	if (node->param != $3.t) {
+		yyerror("function argument type mismatch");
+	}
+	$$.t = node->result;
+	$$.var = varctr++;
+	type2str(tbuf1, node->result);
+	type2str(tbuf2, node->result);
+	printf("\t%%tmp%d = call %s @%s(%s %%tmp%d)\n",
+			$$.var, tbuf1, $1, tbuf2, $3.var);
 }
 
 expression : expression_0 {$$ = $1;}
@@ -270,7 +298,48 @@ block : ;
 
 block : block statement;
 
-program : block;
+/* XXX merge this with the next production */
+declaration : typename IDENTIFIER '(' U0 ')' {
+	char tbuf[64];
+	struct function *node;
+
+	node = functioninfo($2);
+	if (node != NULL) {
+		yyerror("function redeclared");
+	}
+	pushfunction($2, $1, -1);
+	type2str(tbuf, $1);
+	pushscope();
+	printf("define %s @%s() {\n", tbuf, $2);
+} '{' block '}' {
+	popscope();
+	printf("}\n");
+}
+
+declaration : typename IDENTIFIER '(' typename IDENTIFIER ')' {
+	int n;
+	char tbuf1[64], tbuf2[64];
+	struct function *node;
+
+	node = functioninfo($2);
+	if (node != NULL) {
+		yyerror("function redeclared");
+	}
+	pushfunction($2, $1, $4);
+	type2str(tbuf1, $1);
+	type2str(tbuf2, $4);
+	pushscope();
+	n = pushsymbol($5, $4);
+	printf("define %s @%s(%s %%%s%dvar) {\n", tbuf1, $2, tbuf2, $5, n);
+	printf("\t%%%s%d = alloca %s\n\tstore %s %%%s%dvar, ptr %%%s%d\n",
+			$5, n, tbuf2, tbuf2, $5, n, $5, n);
+} '{' block '}' {
+	popscope();
+	printf("}\n");
+}
+
+program : ;
+program : program declaration;
 
 %%
 
@@ -329,6 +398,32 @@ symbolinfo(char *id)
 		if (strcmp(ptr->id, id) == 0)
 			return ptr;
 	}
+	return NULL;
+}
+
+static struct function *functionlist;
+
+void
+pushfunction(char *name, enum type result, enum type param)
+{
+	struct function *node;
+
+	node = malloc(sizeof(struct function));
+	node->name = name;
+	node->result = result;
+	node->param = param;
+	node->next = functionlist;
+	functionlist = node;
+}
+
+struct function *
+functioninfo(char *name)
+{
+	struct function *node;
+
+	for (node = functionlist; node != NULL; node = node->next)
+		if (strcmp(node->name, name) == 0)
+			return node;
 	return NULL;
 }
 
@@ -538,12 +633,8 @@ endloop(void)
 int
 main()
 {
-	int r;
 #ifdef YYDEBUG
 	yydebug = 1;
 #endif
-	printf("define i32 @main() {\n");
-	r = yyparse();
-	printf("}\n");
-	return r;
+	return yyparse();
 }

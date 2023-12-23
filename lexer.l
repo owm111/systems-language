@@ -20,6 +20,7 @@
 "<=" return LESSEQUAL;
 ">=" return GREATEREQUAL;
 
+"u0" return U0;
 "u1" return U1;
 "i32" return I32;
 "i64" return I64;
