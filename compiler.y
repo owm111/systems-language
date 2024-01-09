@@ -34,7 +34,7 @@ int varctr;
 /* symbol table */
 
 struct symbol {
-	char *id; /* actual name in user code */
+	char id[MAX_IDENTIFIER_SIZE]; /* actual name in user code */
 	int n; /* unique identifier to avoid capturing */
 	enum type t;
 	struct symbol *next;
@@ -48,14 +48,14 @@ static void pushscope(void);
 /* delete the last scope (this pops everything until the next NULL) */
 static void popscope(void);
 /* add a symbol to the list and return a unique identifier */
-static int pushsymbol(char *id, enum type t);
+static int pushsymbol(char id[MAX_IDENTIFIER_SIZE], enum type t);
 /* return a pointer to the symbol, or NULL if it does not exist */
-static struct symbol *symbolinfo(char *id);
+static struct symbol *symbolinfo(char id[MAX_IDENTIFIER_SIZE]);
 
 /* list of functions */
 
 struct function {
-	char *name;
+	char name[MAX_IDENTIFIER_SIZE];
 	enum type result, param;
 	struct function *next;
 };
@@ -64,9 +64,10 @@ struct function {
 static struct function *functionlist;
 
 /* add a function */
-static void pushfunction(char *name, enum type result, enum type param);
+static void pushfunction(char name[MAX_IDENTIFIER_SIZE], enum type result,
+		enum type param);
 /* look up a function */
-static struct function *functioninfo(char *name);
+static struct function *functioninfo(char name[MAX_IDENTIFIER_SIZE]);
 
 /* stack of labels */
 
@@ -115,7 +116,7 @@ static void endloop(void);
 
 %union {
 	/* lexer outputs */
-	char *identifier;
+	char identifier[MAX_IDENTIFIER_SIZE];
 	long int constant;
 	/* parser outputs */
 	enum type type;
@@ -348,7 +349,10 @@ yyerror(const char *restrict msg)
 void
 pushscope(void)
 {
-	pushsymbol(NULL, 0);
+	char nil[MAX_IDENTIFIER_SIZE];
+
+	nil[0] = '\0';
+	pushsymbol(nil, 0);
 }
 
 void
@@ -357,10 +361,9 @@ popscope(void)
 	struct symbol *ptr, *dead;
 
 	ptr = symbols;
-	while (ptr != NULL && ptr->id != NULL) {
+	while (ptr != NULL && ptr->id[0] != '\0') {
 		dead = ptr;
 		ptr = ptr->next;
-		free(dead->id);
 		free(dead);
 	}
 	if (ptr == NULL)
@@ -370,12 +373,12 @@ popscope(void)
 }
 
 int
-pushsymbol(char *id, enum type t)
+pushsymbol(char id[MAX_IDENTIFIER_SIZE], enum type t)
 {
 	struct symbol *new;
 
 	new = malloc(sizeof(struct symbol));
-	new->id = id;
+	strcpy(new->id, id);
 	new->n = varctr++;
 	new->t = t;
 	new->next = symbols;
@@ -384,12 +387,12 @@ pushsymbol(char *id, enum type t)
 }
 
 struct symbol *
-symbolinfo(char *id)
+symbolinfo(char id[MAX_IDENTIFIER_SIZE])
 {
 	struct symbol *ptr;
 
 	for (ptr = symbols; ptr != NULL; ptr = ptr->next) {
-		if (ptr->id == NULL)
+		if (ptr->id[0] == '\0')
 			continue;
 		if (strcmp(ptr->id, id) == 0)
 			return ptr;
@@ -398,12 +401,12 @@ symbolinfo(char *id)
 }
 
 void
-pushfunction(char *name, enum type result, enum type param)
+pushfunction(char name[MAX_IDENTIFIER_SIZE], enum type result, enum type param)
 {
 	struct function *node;
 
 	node = malloc(sizeof(struct function));
-	node->name = name;
+	strcpy(node->name, name);
 	node->result = result;
 	node->param = param;
 	node->next = functionlist;
@@ -411,7 +414,7 @@ pushfunction(char *name, enum type result, enum type param)
 }
 
 struct function *
-functioninfo(char *name)
+functioninfo(char name[MAX_IDENTIFIER_SIZE])
 {
 	struct function *node;
 

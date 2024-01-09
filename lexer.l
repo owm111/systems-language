@@ -36,9 +36,12 @@
 "while" return WHILE;
 
 [a-zA-Z_][a-zA-Z0-9_]* {
-	yylval.identifier = malloc(yyleng + 1);
-	memcpy(yylval.identifier, yytext, yyleng);
-	yylval.identifier[yyleng] = '\0';
+	int bytes;
+
+	bytes = snprintf(yylval.identifier, MAX_IDENTIFIER_SIZE, "%s", yytext);
+	if (bytes >= MAX_IDENTIFIER_SIZE) {
+		yyerror("identifier too long");
+	}
 	return IDENTIFIER;
 }
 
