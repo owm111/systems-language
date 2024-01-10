@@ -46,11 +46,7 @@
 }
 
 [0-9][0-9]* {
-	char buf[yyleng + 1];
-
-	memcpy(buf, yytext, yyleng);
-	buf[yyleng] = '\0';
-	yylval.constant = strtol(buf, NULL, 10);
+	yylval.constant = strtol(yytext, NULL, 10);
 	return CONSTANT;
 }
 
