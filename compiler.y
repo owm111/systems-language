@@ -11,7 +11,6 @@ Feature ideas:
 Improvments:
 - implement hash table as a symbol table (but then how does scoping work?)
 - fix space leaks (there have to be some)
-- type names are really annoying as-is...
 
 References:
 - https://llvm.org/docs/LangRef.html
@@ -36,7 +35,7 @@ int varctr;
 struct symbol {
 	char id[MAX_IDENTIFIER_SIZE]; /* actual name in user code */
 	int n; /* unique identifier to avoid capturing */
-	enum type t;
+	struct type t;
 	struct symbol *next;
 };
 
@@ -48,7 +47,7 @@ static void pushscope(void);
 /* delete the last scope (this pops everything until the next NULL) */
 static void popscope(void);
 /* add a symbol to the list and return a unique identifier */
-static int pushsymbol(char id[MAX_IDENTIFIER_SIZE], enum type t);
+static int pushsymbol(char id[MAX_IDENTIFIER_SIZE], struct type t);
 /* return a pointer to the symbol, or NULL if it does not exist */
 static struct symbol *symbolinfo(char id[MAX_IDENTIFIER_SIZE]);
 
@@ -56,7 +55,7 @@ static struct symbol *symbolinfo(char id[MAX_IDENTIFIER_SIZE]);
 
 struct function {
 	char name[MAX_IDENTIFIER_SIZE];
-	enum type result, param;
+	struct type result, param;
 	struct function *next;
 };
 
@@ -64,8 +63,8 @@ struct function {
 static struct function *functionlist;
 
 /* add a function */
-static void pushfunction(char name[MAX_IDENTIFIER_SIZE], enum type result,
-		enum type param);
+static void pushfunction(char name[MAX_IDENTIFIER_SIZE], struct type result,
+		struct type param);
 /* look up a function */
 static struct function *functioninfo(char name[MAX_IDENTIFIER_SIZE]);
 
@@ -88,18 +87,15 @@ static int poplabel(void);
 
 /* utilities for working with types */
 
-/* write the name of the llvm type to the buffer */
-extern void type2str(char *buf, enum type t);
-
 /* is this an unsigned, integral type? */
-static int isunsigned(enum type t);
+static int isunsigned(struct type t);
 /* is this a floating-point, numeric type? */
-static int isfloat(enum type t);
+static int isfloat(struct type t);
 
 /* generating code */
 
 static void cast(struct expressionresult *r, struct expressionresult s,
-		enum type desttyp);
+		struct type desttyp);
 static void arithbinop(const char *signedinstr, const char *unsignedinstr,
 		const char *floatinstr, struct expressionresult *r,
 		struct expressionresult s, struct expressionresult t);
@@ -119,7 +115,7 @@ static void endloop(void);
 	char identifier[MAX_IDENTIFIER_SIZE];
 	long int constant;
 	/* parser outputs */
-	enum type type;
+	struct type type;
 	struct expressionresult expression;
 }
 
@@ -148,13 +144,13 @@ static void endloop(void);
 
 %%
 
-typename : U1  {$$ = U1T;}
-typename : I32 {$$ = I32T;}
-typename : I64 {$$ = I64T;}
-typename : U32 {$$ = U32T;}
-typename : U64 {$$ = U64T;}
-typename : F32 {$$ = F32T;}
-typename : F64 {$$ = F64T;}
+typename : U1  {$$ = u1t;}
+typename : I32 {$$ = i32t;}
+typename : I64 {$$ = i64t;}
+typename : U32 {$$ = u32t;}
+typename : U64 {$$ = u64t;}
+typename : F32 {$$ = f32t;}
+typename : F64 {$$ = f64t;}
 
 expression_0 : '(' expression ')' {
 	$$ = $2;
@@ -162,7 +158,6 @@ expression_0 : '(' expression ')' {
 
 expression_0 : IDENTIFIER {
 	struct symbol *sym;
-	char tbuf[32];
 
 	sym = symbolinfo($1);
 	if (sym == NULL) {
@@ -170,35 +165,33 @@ expression_0 : IDENTIFIER {
 	}
 	$$.var = varctr++;
 	$$.t = sym->t;
-	type2str(tbuf, sym->t);
-	printf("\t%%tmp%d = load %s, ptr %%%s%d\n", $$.var, tbuf, $1, sym->n);
+	printf("\t%%tmp%d = load %s, ptr %%%s%d\n",
+			$$.var, sym->t.lltype, $1, sym->n);
 }
 
 expression_0 : CONSTANT {
 	$$.var = varctr++;
-	$$.t = I64T;
-	printf("\t%%tmp%d = add i64 %lu, 0\n", $$.var, $1);
+	$$.t = i64t;
+	strcpy($$.t.lltype, "i64");
+	printf("\t%%tmp%d = add %s %lu, 0\n", $$.var, $$.t.lltype, $1);
 }
 
 expression_0 : CAST '(' expression ',' typename ')' {cast(&$$, $3, $5);}
 
 expression_0 : IDENTIFIER '(' expression ')' {
 	struct function *node;
-	char tbuf1[64], tbuf2[64];
 
 	node = functioninfo($1);
 	if (node == NULL) {
 		yyerror("undeclared function");
 	}
-	if (node->param != $3.t) {
+	if (node->param.tag != $3.t.tag) {
 		yyerror("function argument type mismatch");
 	}
 	$$.t = node->result;
 	$$.var = varctr++;
-	type2str(tbuf1, node->result);
-	type2str(tbuf2, node->result);
 	printf("\t%%tmp%d = call %s @%s(%s %%tmp%d)\n",
-			$$.var, tbuf1, $1, tbuf2, $3.var);
+			$$.var, $$.t.lltype, $1, $3.t.lltype, $3.var);
 }
 
 expression : expression_0 {$$ = $1;}
@@ -231,19 +224,18 @@ expression : expression '<' expression {cmpbinop("lt", &$$, $1, $3);}
 expression : expression '>' expression {cmpbinop("gt", &$$, $1, $3);}
 
 expression : IDENTIFIER '=' expression {
-	char tbuf[64];
 	struct symbol *sym;
 
 	sym = symbolinfo($1);
 	if (sym == NULL) {
 		yyerror("undeclared variable");
 	}
-	if (sym->t != $3.t) {
+	if (sym->t.tag != $3.t.tag) {
 		yyerror("type mismatch");
 	}
-	type2str(tbuf, sym->t);
 	$$ = $3;
-	printf("\tstore %s %%tmp%d, ptr %%%s%d\n", tbuf, $3.var, $1, sym->n);
+	printf("\tstore %s %%tmp%d, ptr %%%s%d\n",
+			sym->t.lltype, $3.var, $1, sym->n);
 }
 
 statement : '{' {pushscope();} block '}' {popscope();}
@@ -268,18 +260,14 @@ statement : WHILE {beginloop();} '(' expression ')' {middleloop($4);} statement 
 }
 
 statement : RETURN expression ';' {
-	char tbuf[64];
-
-	if ($2.t != I32T) {
+	if ($2.t.tag != I32T) {
 		yyerror("type mismatch");
 	}
-	type2str(tbuf, $2.t);
-	printf("\tret %s %%tmp%d\n", tbuf, $2.var);
+	printf("\tret %s %%tmp%d\n", $2.t.lltype, $2.var);
 }
 
 statement : typename IDENTIFIER ';' {
 	int n;
-	char tbuf[64];
 	struct symbol *sym;
 
 	sym = symbolinfo($2);
@@ -287,8 +275,7 @@ statement : typename IDENTIFIER ';' {
 		yyerror("already declared");
 	}
 	n = pushsymbol($2, $1);
-	type2str(tbuf, $1);
-	printf("\t%%%s%d = alloca %s\n", $2, n, tbuf);
+	printf("\t%%%s%d = alloca %s\n", $2, n, $1.lltype);
 }
 
 block : ;
@@ -297,17 +284,17 @@ block : block statement;
 
 /* XXX merge this with the next production */
 declaration : typename IDENTIFIER '(' U0 ')' {
-	char tbuf[64];
+	struct type unit;
 	struct function *node;
 
 	node = functioninfo($2);
 	if (node != NULL) {
 		yyerror("function redeclared");
 	}
-	pushfunction($2, $1, -1);
-	type2str(tbuf, $1);
+	unit.tag = LAST_TYPE;
+	pushfunction($2, $1, unit);
 	pushscope();
-	printf("define %s @%s() {\n", tbuf, $2);
+	printf("define %s @%s() {\n", $1.lltype, $2);
 } '{' block '}' {
 	popscope();
 	printf("}\n");
@@ -315,7 +302,6 @@ declaration : typename IDENTIFIER '(' U0 ')' {
 
 declaration : typename IDENTIFIER '(' typename IDENTIFIER ')' {
 	int n;
-	char tbuf1[64], tbuf2[64];
 	struct function *node;
 
 	node = functioninfo($2);
@@ -323,13 +309,12 @@ declaration : typename IDENTIFIER '(' typename IDENTIFIER ')' {
 		yyerror("function redeclared");
 	}
 	pushfunction($2, $1, $4);
-	type2str(tbuf1, $1);
-	type2str(tbuf2, $4);
 	pushscope();
 	n = pushsymbol($5, $4);
-	printf("define %s @%s(%s %%%s%dvar) {\n", tbuf1, $2, tbuf2, $5, n);
+	printf("define %s @%s(%s %%%s%dvar) {\n",
+			$1.lltype, $2, $4.lltype, $5, n);
 	printf("\t%%%s%d = alloca %s\n\tstore %s %%%s%dvar, ptr %%%s%d\n",
-			$5, n, tbuf2, tbuf2, $5, n, $5, n);
+			$5, n, $4.lltype, $4.lltype, $5, n, $5, n);
 } '{' block '}' {
 	popscope();
 	printf("}\n");
@@ -339,6 +324,14 @@ program : ;
 program : program declaration;
 
 %%
+
+const struct type u1t  = {.tag = U1T,  .lltype = "i1"};
+const struct type i32t = {.tag = I32T, .lltype = "i32"};
+const struct type i64t = {.tag = I64T, .lltype = "i64"};
+const struct type u32t = {.tag = U32T, .lltype = "i32"};
+const struct type u64t = {.tag = U64T, .lltype = "i64"};
+const struct type f32t = {.tag = F32T, .lltype = "float"};
+const struct type f64t = {.tag = F64T, .lltype = "double"};
 
 int
 yyerror(const char *restrict msg)
@@ -350,9 +343,11 @@ void
 pushscope(void)
 {
 	char nil[MAX_IDENTIFIER_SIZE];
+	struct type t;
 
 	nil[0] = '\0';
-	pushsymbol(nil, 0);
+	t.tag = LAST_TYPE;
+	pushsymbol(nil, t);
 }
 
 void
@@ -373,7 +368,7 @@ popscope(void)
 }
 
 int
-pushsymbol(char id[MAX_IDENTIFIER_SIZE], enum type t)
+pushsymbol(char id[MAX_IDENTIFIER_SIZE], struct type t)
 {
 	struct symbol *new;
 
@@ -401,7 +396,8 @@ symbolinfo(char id[MAX_IDENTIFIER_SIZE])
 }
 
 void
-pushfunction(char name[MAX_IDENTIFIER_SIZE], enum type result, enum type param)
+pushfunction(char name[MAX_IDENTIFIER_SIZE], struct type result,
+		struct type param)
 {
 	struct function *node;
 
@@ -424,38 +420,23 @@ functioninfo(char name[MAX_IDENTIFIER_SIZE])
 	return NULL;
 }
 
-void
-type2str(char *buf, enum type t)
+int
+isunsigned(struct type t)
 {
-	static const char *names[LAST_TYPE] = {
-		[U1T] = "i1",
-		[I32T] = "i32", [I64T] = "i64",
-		[U32T] = "i32", [U64T] = "i64",
-		[F32T] = "float", [F64T] = "double",
-	};
-	sprintf(buf, "%s", names[t]);
+	return t.tag == U32T || t.tag == U64T;
 }
 
 int
-isunsigned(enum type t)
+isfloat(struct type t)
 {
-	return t == U32T || t == U64T;
-}
-
-int
-isfloat(enum type t)
-{
-	return t == F32T || t == F64T;
+	return t.tag == F32T || t.tag == F64T;
 }
 
 void
 binop(const char *restrict instr, YYSTYPE r, YYSTYPE s, YYSTYPE t)
 {
-	char tbuf[512];
-
-	type2str(tbuf, r.expression.t);
 	printf("\t%%tmp%d = %s %s %%tmp%d, %%tmp%d\n",
-			r.expression.var, instr, tbuf,
+			r.expression.var, instr, r.expression.t.lltype,
 			s.expression.var, t.expression.var);
 }
 
@@ -487,7 +468,7 @@ poplabel(void)
 
 void
 cast(struct expressionresult *r, struct expressionresult s,
-		enum type desttyp)
+		struct type desttyp)
 {
 	/* converting between numeric types */
 	static const char *casttable[LAST_TYPE /* from */][LAST_TYPE /* to */] = {
@@ -535,15 +516,12 @@ cast(struct expressionresult *r, struct expressionresult s,
 		},
 	};
 	const char *cast;
-	char tbuf1[64], tbuf2[64];
 
 	r->var = varctr++;
 	r->t = desttyp;
-	cast = casttable[s.t][desttyp];
-	type2str(tbuf1, s.t);
-	type2str(tbuf2, desttyp);
+	cast = casttable[s.t.tag][desttyp.tag];
 	printf("\t%%tmp%d = %s %s %%tmp%d to %s\n",
-			r->var, cast, tbuf1, s.var, tbuf2);
+			r->var, cast, s.t.lltype, s.var, desttyp.lltype);
 }
 
 void
@@ -551,10 +529,9 @@ arithbinop(const char *signedinstr, const char *unsignedinstr,
 		const char *floatinstr, struct expressionresult *r,
 		struct expressionresult s, struct expressionresult t)
 {
-	char tbuf[64];
 	const char *instr;
 
-	if (s.t != t.t)
+	if (s.t.tag != t.t.tag)
 		yyerror("type mismatch");
 	r->var = varctr++;
 	r->t = s.t;
@@ -565,28 +542,27 @@ arithbinop(const char *signedinstr, const char *unsignedinstr,
 	} else {
 		instr = signedinstr;
 	}
-	type2str(tbuf, r->t);
-	printf("\t%%tmp%d = %s %s %%tmp%d, %%tmp%d\n", r->var, instr, tbuf,
-			s.var, t.var);
+	printf("\t%%tmp%d = %s %s %%tmp%d, %%tmp%d\n",
+			r->var, instr, r->t.lltype, s.var, t.var);
 }
 
 void
 cmpbinop(const char *cond, struct expressionresult *r,
 		struct expressionresult s, struct expressionresult t)
 {
-	char instr, tbuf[64];
+	char instr;
 	const char *prefix;
 	int isequality;
 
-	if (s.t != t.t) {
+	if (s.t.tag != t.t.tag) {
 		yyerror("type mismatch");
 	}
 	isequality = strcmp(cond, "eq") == 0 || strcmp(cond, "ne") == 0;
-	if (s.t == U1T && !isequality) {
+	if (s.t.tag == U1T && !isequality) {
 		yyerror("can't order booleans");
 	}
 	r->var = varctr++;
-	r->t = U1T;
+	r->t = u1t;
 	instr = isfloat(r->t) ? 'f' : 'i';
 	if (isfloat(r->t)) {
 		prefix = "o";
@@ -597,9 +573,8 @@ cmpbinop(const char *cond, struct expressionresult *r,
 	} else {
 		prefix = "s";
 	}
-	type2str(tbuf, s.t);
-	printf("\t%%tmp%d = %ccmp %s%s %s %%tmp%d, %%tmp%d\n", r->var, instr,
-			prefix, cond, tbuf, s.var, t.var);
+	printf("\t%%tmp%d = %ccmp %s%s %s %%tmp%d, %%tmp%d\n",
+			r->var, instr, prefix, cond, s.t.lltype, s.var, t.var);
 }
 
 void
@@ -607,7 +582,7 @@ beginconditional(struct expressionresult cond)
 {
 	int label1, label2, label3;
 
-	if (cond.t != U1T) {
+	if (cond.t.tag != U1T) {
 		yyerror("conditions must be booleans");
 	}
 	label1 = varctr++;
@@ -658,7 +633,7 @@ middleloop(struct expressionresult cond)
 {
 	int label1, label2, label3;
 
-	if (cond.t != U1T) {
+	if (cond.t.tag != U1T) {
 		yyerror("conditions must be booleans");
 	}
 	label3 = poplabel();
