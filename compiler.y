@@ -117,6 +117,7 @@ static int isfloat(struct type t);
 
 static void printresultlltype(int nresults, struct type *results);
 static void storei8(int ptr, int idx, char i8);
+static int call(struct function *fn, int nargs, struct expressionresult *args);
 static void cast(struct expressionresult *r, struct expressionresult s,
 		struct type desttyp);
 static void arithbinop(const char *signedinstr, const char *unsignedinstr,
@@ -168,7 +169,10 @@ static void endloop(void);
 %type <type> typename
 %type <expression> expression expression_0
 %type <typelist> anon_nple anon_nple_nonempty named_nple named_nple_nonempty
+%type <typelist> ident_nple_2plus
 %type <expressionlist> expression_nple expression_nple_nonempty
+
+%expect 1
 
 %start program
 
@@ -232,17 +236,7 @@ expression_0 : IDENTIFIER '(' expression_nple ')' {
 		yyerror("function result count ≠ 1");
 	}
 	$$.t = node->results[0];
-	$$.var = varctr++;
-	printf("\t%%tmp%d = call ", $$.var);
-	printresultlltype(node->nresults, node->results);
-	printf(" @%s(", $1);
-	for (i = 0; i < narguments; i++) {
-		if (i != 0) {
-			printf(", ");
-		}
-		printf("%s %%tmp%d", arguments[i].t.lltype, arguments[i].var);
-	}
-	printf(")\n");
+	$$.var = call(node, narguments, arguments);
 }
 
 expression : expression_0 {$$ = $1;}
@@ -303,6 +297,89 @@ statement : '{' {pushscope();} block '}' {popscope();}
 statement : ';';
 
 statement : expression ';';
+
+statement : IDENTIFIER '(' expression_nple ')' ';' {
+	int i;
+	int narguments;
+	struct function *node;
+
+	narguments = expressionlistlen($3);
+	struct expressionresult arguments[narguments];
+	storeexpressionlist($3, arguments);
+	node = functioninfo($1);
+	if (node == NULL) {
+		yyerror("undeclared function");
+	}
+	if (narguments != node->nparams) {
+		yyerror("function argument number mismatch");
+	}
+	for (i = 0; i < narguments; i++) {
+		if (node->params[i].tag != arguments[i].t.tag) {
+			yyerror("function argument type mismatch");
+		}
+	}
+	if (node->nresults != 0) {
+		yyerror("function result count ≠ 0");
+	}
+	call(node, narguments, arguments);
+}
+
+statement : ident_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
+	int i;
+	int narguments, nresults;
+	int agg, tmp;
+	struct function *node;
+
+	/* store nples */
+	narguments = expressionlistlen($5);
+	nresults = typelistlen($1);
+	struct expressionresult arguments[narguments];
+	char names[nresults][MAX_IDENTIFIER_SIZE];
+	storeexpressionlist($5, arguments);
+	storetypelist($1, NULL, names);
+	/* get function info */
+	node = functioninfo($3);
+	/* get symbol info */
+	struct symbol *syms[nresults];
+	for (i = 0; i < nresults; i++) {
+		syms[i] = symbolinfo(names[i]);
+	}
+	/* check function */
+	if (node == NULL) {
+		yyerror("undeclared function");
+	}
+	if (narguments != node->nparams) {
+		yyerror("function argument number mismatch");
+	}
+	for (i = 0; i < narguments; i++) {
+		if (node->params[i].tag != arguments[i].t.tag) {
+			yyerror("function argument type mismatch");
+		}
+	}
+	if (node->nresults != nresults) {
+		yyerror("function result count does not match number of "
+				"identifiers");
+	}
+	/* check symbols */
+	for (i = 0; i < nresults; i++) {
+		if (syms[i] == NULL) {
+			yyerror("undeclared variable");
+		}
+		if (syms[i]->t.tag != node->results[i].tag) {
+			yyerror("result type mismtach");
+		}
+	}
+	/* write the instructions */
+	agg = call(node, narguments, arguments);
+	for (i = 0; i < nresults; i++) {
+		tmp = varctr++;
+		printf("\t%%tmp%d = extractvalue ", tmp);
+		printresultlltype(nresults, node->results);
+		printf("%%tmp%d, %d\n", agg, i);
+		printf("\tstore %s %%tmp%d, ptr %%%s%d\n",
+				syms[i]->t.lltype, tmp, names[i], syms[i]->n);
+	}
+}
 
 ifheader : '(' expression ')' {beginconditional($2);}
 
@@ -408,6 +485,14 @@ anon_nple_nonempty : anon_nple_nonempty ',' typename {
 
 	nil[0] = '\0';
 	$$ = snoctypelist($1, $3, nil);
+}
+
+ident_nple_2plus : IDENTIFIER ',' IDENTIFIER {
+	$$ = snoctypelist(NULL, u1t, $1);
+	$$ = snoctypelist($$, u1t, $3);
+}
+ident_nple_2plus : ident_nple_2plus ',' IDENTIFIER {
+	$$ = snoctypelist($1, u1t, $3);
 }
 
 named_nple : U0 {$$ = NULL;}
@@ -726,6 +811,25 @@ storei8(int ptr, int idx, char i8)
 			elemptr, ptr, idx);
 	printf("\tstore i8 u0x%x, ptr %%tmp%d\n",
 			i8, elemptr);
+}
+
+int
+call(struct function *fn, int nargs, struct expressionresult *args)
+{
+	int i, result;
+
+	result = varctr++;
+	printf("\t%%tmp%d = call ", result);
+	printresultlltype(fn->nresults, fn->results);
+	printf(" @%s(", fn->name);
+	for (i = 0; i < nargs; i++) {
+		if (i != 0) {
+			printf(", ");
+		}
+		printf("%s %%tmp%d", args[i].t.lltype, args[i].var);
+	}
+	printf(")\n");
+	return result;
 }
 
 void
