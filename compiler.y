@@ -116,6 +116,7 @@ static int isfloat(struct type t);
 /* generating code */
 
 static void printresultlltype(int nresults, struct type *results);
+static void storei8(int ptr, int idx, char i8);
 static void cast(struct expressionresult *r, struct expressionresult s,
 		struct type desttyp);
 static void arithbinop(const char *signedinstr, const char *unsignedinstr,
@@ -135,6 +136,7 @@ static void endloop(void);
 %union {
 	/* lexer outputs */
 	char identifier[MAX_IDENTIFIER_SIZE];
+	char strlit[MAX_STRLIT_SIZE];
 	long int constant;
 	/* parser outputs */
 	struct type type;
@@ -145,10 +147,12 @@ static void endloop(void);
 
 %token <identifier> IDENTIFIER
 %token <constant> CONSTANT
+%token <strlit> STRING_LITERAL
 /* types */
 %token U0 U1 I32 I64 U32 U64 F32 F64
 /* expressions */
 %token CAST
+%token PRINTF
 /* statements */
 %token IF
 %token WHILE
@@ -364,6 +368,27 @@ statement : typename IDENTIFIER ';' {
 	}
 	n = pushsymbol($2, $1);
 	printf("\t%%%s%d = alloca %s\n", $2, n, $1.lltype);
+}
+
+statement : PRINTF '(' STRING_LITERAL ',' expression_nple ')' ';' {
+	int i, len, nargs, strlit;
+
+	len = strlen($3);
+	nargs = expressionlistlen($5);
+	struct expressionresult args[nargs];
+	storeexpressionlist($5, args);
+	/* store the string literal */
+	strlit = varctr++;
+	printf("\t%%tmp%d = alloca i8, i32 %d\n", strlit, len + 1);
+	for (i = 0; i < len; i++)
+		storei8(strlit, i, $3[i]);
+	storei8(strlit, len, '\0');
+	/* call printf */
+	printf("\tcall i32(ptr, ...) @printf(ptr %%tmp%d", strlit);
+	for (i = 0; i < nargs; i++) {
+		printf(", %s %%tmp%d", args[i].t.lltype, args[i].var);
+	}
+	printf(")\n");
 }
 
 block : ;
@@ -692,6 +717,18 @@ printresultlltype(int nresults, struct type *results)
 }
 
 void
+storei8(int ptr, int idx, char i8)
+{
+	int elemptr;
+
+	elemptr = varctr++;
+	printf("\t%%tmp%d = getelementptr i8, ptr %%tmp%d, i32 %d\n",
+			elemptr, ptr, idx);
+	printf("\tstore i8 u0x%x, ptr %%tmp%d\n",
+			i8, elemptr);
+}
+
+void
 cast(struct expressionresult *r, struct expressionresult s,
 		struct type desttyp)
 {
@@ -887,5 +924,6 @@ main()
 #ifdef YYDEBUG
 	yydebug = 1;
 #endif
+	printf("declare i32 @printf(i8* noalias nocapture, ...)\n");
 	return yyparse();
 }

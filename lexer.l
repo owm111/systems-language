@@ -4,7 +4,11 @@
 
 #include "header.h"
 #include "y.tab.h"
+
+static char *strlitptr;
 %}
+
+%x STRLIT
 
 %option noyywrap
 
@@ -30,6 +34,7 @@
 "f64" return F64;
 
 "cast" return CAST;
+"printf" return PRINTF;
 "if" return IF;
 "else" return ELSE;
 "return" return RETURN;
@@ -49,6 +54,24 @@
 	yylval.constant = strtol(yytext, NULL, 10);
 	return CONSTANT;
 }
+
+\" {
+	BEGIN STRLIT;
+	strlitptr = yylval.strlit;
+}
+<STRLIT>\\n *strlitptr++ = '\n';
+<STRLIT>\\t *strlitptr++ = '\t';
+<STRLIT>\\\" *strlitptr++ = '"';
+<STRLIT>\" {
+	*strlitptr = '\0';
+	BEGIN 0;
+	return STRING_LITERAL;
+}
+<STRLIT>\n {
+	yyerror("Unterminated string literal\n");
+	exit(1);
+}
+<STRLIT>. *strlitptr++ = yytext[0];
 
 . {
 	yyerror("Unrecognized input\n");

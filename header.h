@@ -1,6 +1,7 @@
 #define MAX_IDENTIFIER_SIZE 64
 #define MAX_LLTYPE_SIZE 64
 #define MAX_NPLE_SIZE 8
+#define MAX_STRLIT_SIZE 512
 
 enum typetag {U1T, I32T, I64T, U32T, U64T, F32T, F64T, LAST_TYPE};
 
