@@ -5,7 +5,6 @@ Current problems:
 - casting to/from booleans: should it be "smart?"
 
 Feature ideas:
-- functions return nples
 - loops can have multiple exits
 
 Improvments:
@@ -55,7 +54,8 @@ static struct symbol *symbolinfo(char id[MAX_IDENTIFIER_SIZE]);
 
 struct function {
 	char name[MAX_IDENTIFIER_SIZE];
-	struct type result, param;
+	int nresults, nparams;
+	struct type results[MAX_NPLE_SIZE], params[MAX_NPLE_SIZE];
 	struct function *next;
 };
 
@@ -63,10 +63,31 @@ struct function {
 static struct function *functionlist;
 
 /* add a function */
-static void pushfunction(char name[MAX_IDENTIFIER_SIZE], struct type result,
-		struct type param);
+static void pushfunction(char name[MAX_IDENTIFIER_SIZE], int nresults,
+		struct type *result, int nparams, struct type *param);
 /* look up a function */
 static struct function *functioninfo(char name[MAX_IDENTIFIER_SIZE]);
+
+/* the current function's return type */
+
+static int nrettypes;
+static struct type rettypes[MAX_NPLE_SIZE];
+
+/* type lists */
+
+static int typelistlen(struct typelist *lst);
+static struct typelist *snoctypelist(struct typelist *lst, struct type t,
+		char ident[MAX_IDENTIFIER_SIZE]);
+static void storetypelist(struct typelist *lst, struct type *results,
+		char (*ident)[MAX_IDENTIFIER_SIZE]);
+
+/* expression lists */
+
+static int expressionlistlen(struct expressionlist *lst);
+static struct expressionlist *snocexpressionlist(struct expressionlist *lst,
+		int var, struct type t);
+static void storeexpressionlist(struct expressionlist *lst,
+		struct expressionresult *results);
 
 /* stack of labels */
 
@@ -94,6 +115,7 @@ static int isfloat(struct type t);
 
 /* generating code */
 
+static void printresultlltype(int nresults, struct type *results);
 static void cast(struct expressionresult *r, struct expressionresult s,
 		struct type desttyp);
 static void arithbinop(const char *signedinstr, const char *unsignedinstr,
@@ -117,6 +139,8 @@ static void endloop(void);
 	/* parser outputs */
 	struct type type;
 	struct expressionresult expression;
+	struct expressionlist *expressionlist;
+	struct typelist *typelist;
 }
 
 %token <identifier> IDENTIFIER
@@ -139,6 +163,8 @@ static void endloop(void);
 
 %type <type> typename
 %type <expression> expression expression_0
+%type <typelist> anon_nple anon_nple_nonempty named_nple named_nple_nonempty
+%type <expressionlist> expression_nple expression_nple_nonempty
 
 %start program
 
@@ -178,20 +204,41 @@ expression_0 : CONSTANT {
 
 expression_0 : CAST '(' expression ',' typename ')' {cast(&$$, $3, $5);}
 
-expression_0 : IDENTIFIER '(' expression ')' {
+expression_0 : IDENTIFIER '(' expression_nple ')' {
+	int i;
+	int narguments;
 	struct function *node;
 
+	narguments = expressionlistlen($3);
+	struct expressionresult arguments[narguments];
+	storeexpressionlist($3, arguments);
 	node = functioninfo($1);
 	if (node == NULL) {
 		yyerror("undeclared function");
 	}
-	if (node->param.tag != $3.t.tag) {
-		yyerror("function argument type mismatch");
+	if (narguments != node->nparams) {
+		yyerror("function argument number mismatch");
 	}
-	$$.t = node->result;
+	for (i = 0; i < narguments; i++) {
+		if (node->params[i].tag != arguments[i].t.tag) {
+			yyerror("function argument type mismatch");
+		}
+	}
+	if (node->nresults != 1) {
+		yyerror("function result count ≠ 1");
+	}
+	$$.t = node->results[0];
 	$$.var = varctr++;
-	printf("\t%%tmp%d = call %s @%s(%s %%tmp%d)\n",
-			$$.var, $$.t.lltype, $1, $3.t.lltype, $3.var);
+	printf("\t%%tmp%d = call ", $$.var);
+	printresultlltype(node->nresults, node->results);
+	printf(" @%s(", $1);
+	for (i = 0; i < narguments; i++) {
+		if (i != 0) {
+			printf(", ");
+		}
+		printf("%s %%tmp%d", arguments[i].t.lltype, arguments[i].var);
+	}
+	printf(")\n");
 }
 
 expression : expression_0 {$$ = $1;}
@@ -238,6 +285,15 @@ expression : IDENTIFIER '=' expression {
 			sym->t.lltype, $3.var, $1, sym->n);
 }
 
+expression_nple : {$$ = NULL;}
+expression_nple : expression_nple_nonempty {$$ = $1;}
+expression_nple_nonempty : expression {
+	$$ = snocexpressionlist(NULL, $1.var, $1.t);
+}
+expression_nple_nonempty : expression_nple_nonempty ',' expression {
+	$$ = snocexpressionlist($1, $3.var, $3.t);
+}
+
 statement : '{' {pushscope();} block '}' {popscope();}
 
 statement : ';';
@@ -259,11 +315,43 @@ statement : WHILE {beginloop();} '(' expression ')' {middleloop($4);} statement 
 	endloop();
 }
 
-statement : RETURN expression ';' {
-	if ($2.t.tag != I32T) {
-		yyerror("type mismatch");
+statement : RETURN expression_nple ';' {
+	int i, nresults, agg, lastagg;
+
+	nresults = expressionlistlen($2);
+	struct expressionresult results[nresults];
+	storeexpressionlist($2, results);
+	if (nrettypes != nresults) {
+		yyerror("return type count mismatch");
 	}
-	printf("\tret %s %%tmp%d\n", $2.t.lltype, $2.var);
+	for (i = 0; i < nresults; i++) {
+		if (results[i].t.tag != rettypes[i].tag) {
+			yyerror("return type mismatch");
+		}
+	}
+	if (nresults == 0) {
+		printf("\tret void\n");
+	} else if (nresults == 1) {
+		printf("\tret %s %%tmp%d\n",
+				results[0].t.lltype, results[0].var);
+	} else {
+		agg = varctr++;
+		printf("\t%%tmp%d = insertvalue ", agg);
+		printresultlltype(nresults, rettypes);
+		printf(" undef, %s %%tmp%d, 0\n",
+				rettypes[0].lltype, results[0].var);
+		for (i = 1, lastagg = agg, agg = varctr++; i < nresults;
+				i++, lastagg = agg, agg = varctr++) {
+			printf("\t%%tmp%d = insertvalue ", agg);
+			printresultlltype(nresults, rettypes);
+			printf(" %%tmp%d, %s %%tmp%d, %d\n",
+					lastagg, rettypes[i].lltype,
+					results[i].var, i);
+		}
+		printf("\tret ");
+		printresultlltype(nresults, rettypes);
+		printf(" %%tmp%d\n", lastagg);
+	}
 }
 
 statement : typename IDENTIFIER ';' {
@@ -282,39 +370,67 @@ block : ;
 
 block : block statement;
 
-/* XXX merge this with the next production */
-declaration : typename IDENTIFIER '(' U0 ')' {
-	struct type unit;
-	struct function *node;
+anon_nple : U0 {$$ = NULL;}
+anon_nple : anon_nple_nonempty {$$ = $1;}
+anon_nple_nonempty : typename {
+	char nil[MAX_IDENTIFIER_SIZE];
 
-	node = functioninfo($2);
-	if (node != NULL) {
-		yyerror("function redeclared");
-	}
-	unit.tag = LAST_TYPE;
-	pushfunction($2, $1, unit);
-	pushscope();
-	printf("define %s @%s() {\n", $1.lltype, $2);
-} '{' block '}' {
-	popscope();
-	printf("}\n");
+	nil[0] = '\0';
+	$$ = snoctypelist(NULL, $1, nil);
+}
+anon_nple_nonempty : anon_nple_nonempty ',' typename {
+	char nil[MAX_IDENTIFIER_SIZE];
+
+	nil[0] = '\0';
+	$$ = snoctypelist($1, $3, nil);
 }
 
-declaration : typename IDENTIFIER '(' typename IDENTIFIER ')' {
-	int n;
+named_nple : U0 {$$ = NULL;}
+named_nple : named_nple_nonempty {$$ = $1;}
+named_nple_nonempty : typename IDENTIFIER {
+	$$ = snoctypelist(NULL, $1, $2);
+}
+named_nple_nonempty : named_nple_nonempty ',' typename IDENTIFIER {
+	$$ = snoctypelist($1, $3, $4);
+}
+
+declaration : anon_nple IDENTIFIER '(' named_nple ')' {
+	int i;
+	int nparams, nresults;
 	struct function *node;
 
+	nresults = typelistlen($1);
+	nparams = typelistlen($4);
+	struct type params[nparams], results[nresults];
+	char names[nparams][MAX_IDENTIFIER_SIZE];
+	int nums[nparams];
+	storetypelist($1, results, NULL);
+	storetypelist($4, params, names);
 	node = functioninfo($2);
 	if (node != NULL) {
 		yyerror("function redeclared");
 	}
-	pushfunction($2, $1, $4);
+	pushfunction($2, nresults, results, nparams, params);
 	pushscope();
-	n = pushsymbol($5, $4);
-	printf("define %s @%s(%s %%%s%dvar) {\n",
-			$1.lltype, $2, $4.lltype, $5, n);
-	printf("\t%%%s%d = alloca %s\n\tstore %s %%%s%dvar, ptr %%%s%d\n",
-			$5, n, $4.lltype, $4.lltype, $5, n, $5, n);
+	nrettypes = nresults;
+	memcpy(rettypes, results, sizeof(struct type) * nresults);
+	printf("define ");
+	printresultlltype(nresults, results);
+	printf(" @%s(", $2);
+	for (i = 0; i < nparams; i++) {
+		if (i != 0) {
+			printf(", ");
+		}
+		nums[i] = pushsymbol(names[i], params[i]);
+		printf("%s %%%s%dvar", params[i].lltype, names[i], nums[i]);
+	}
+	printf(") {\n");
+	for (i = 0; i < nparams; i++) {
+		printf("\t%%%s%d = alloca %s\n",
+				names[i], nums[i], params[i].lltype);
+		printf("\tstore %s %%%s%dvar, ptr %%%s%d\n", params[i].lltype,
+				names[i], nums[i], names[i], nums[i]);
+	}
 } '{' block '}' {
 	popscope();
 	printf("}\n");
@@ -396,15 +512,17 @@ symbolinfo(char id[MAX_IDENTIFIER_SIZE])
 }
 
 void
-pushfunction(char name[MAX_IDENTIFIER_SIZE], struct type result,
-		struct type param)
+pushfunction(char name[MAX_IDENTIFIER_SIZE], int nresults, struct type *results,
+		int nparams, struct type *params)
 {
 	struct function *node;
 
 	node = malloc(sizeof(struct function));
 	strcpy(node->name, name);
-	node->result = result;
-	node->param = param;
+	node->nresults = nresults;
+	memcpy(node->results, results, sizeof(struct type) * nresults);
+	node->nparams = nparams;
+	memcpy(node->params, params, sizeof(struct type) * nparams);
 	node->next = functionlist;
 	functionlist = node;
 }
@@ -464,6 +582,113 @@ poplabel(void)
 	labelstack = l->next;
 	free(l);
 	return n;
+}
+
+int
+typelistlen(struct typelist *lst)
+{
+	int i;
+
+	for (i = 0; lst != NULL; lst = lst->next, i++);
+	return i;
+}
+
+struct typelist *
+snoctypelist(struct typelist *lst, struct type t,
+		char ident[MAX_IDENTIFIER_SIZE])
+{
+	struct typelist *result;
+
+	result = malloc(sizeof(struct typelist));
+	result->next = lst;
+	result->t = t;
+	strcpy(result->ident, ident);
+	return result;
+}
+
+void
+storetypelist(struct typelist *lst, struct type *results,
+		char (*ident)[MAX_IDENTIFIER_SIZE])
+{
+	int len;
+	struct typelist *ptr, *dead;
+
+	if (lst == NULL)
+		return;
+	len = typelistlen(lst);
+	for (ptr = lst, len--; ptr != NULL;
+			dead = ptr, ptr = ptr->next, free(dead), len--) {
+		if (results) {
+			results[len] = ptr->t;
+		}
+		if (ident) {
+			strcpy(ident[len], ptr->ident);
+		}
+	}
+}
+
+int
+expressionlistlen(struct expressionlist *lst)
+{
+	int i;
+
+	i = 0;
+	while (lst != NULL) {
+		lst = lst->next;
+		i++;
+	}
+	return i;
+}
+
+struct expressionlist *
+snocexpressionlist(struct expressionlist *lst, int var, struct type t)
+{
+	struct expressionlist *result;
+
+	result = malloc(sizeof(struct expressionlist));
+	result->next = lst;
+	result->var = var;
+	result->t = t;
+	return result;
+}
+
+void
+storeexpressionlist(struct expressionlist *lst,
+		struct expressionresult *results)
+{
+	int len;
+	struct expressionlist *ptr, *dead;
+
+	if (lst == NULL)
+		return;
+	len = expressionlistlen(lst);
+	for (ptr = lst, len--; ptr != NULL;
+			dead = ptr, ptr = ptr->next, free(dead), len--) {
+		results[len].var = ptr->var;
+		results[len].t = ptr->t;
+	}
+}
+
+void
+printresultlltype(int nresults, struct type *results)
+{
+	int i;
+
+	if (nresults == 0) {
+		printf("void");
+		return;
+	}
+	if (nresults == 1) {
+		printf("%s", results[0].lltype);
+		return;
+	}
+	printf("{");
+	for (i = 0; i < nresults; i++) {
+		if (i != 0)
+			printf(", ");
+		printf("%s", results[i].lltype);
+	}
+	printf("}");
 }
 
 void
