@@ -1,10 +1,19 @@
 /*
 Current problems:
+- error handling is bad
 - all constants need to be explicitly cast
 - the source code is just messy
+- returns from u0 functions must be explicit
 - casting to/from booleans: should it be "smart?"
 
 Feature ideas:
+- detect functions that do not return
+- first-class arrays
+- multidimensional arrays
+- nested arrays
+- compile-time array bounds checking
+- lvalues
+- function pointers
 - loops can have multiple exits
 
 Improvments:
@@ -34,6 +43,7 @@ int varctr;
 struct symbol {
 	char id[MAX_IDENTIFIER_SIZE]; /* actual name in user code */
 	int n; /* unique identifier to avoid capturing */
+	int isarray;
 	struct type t;
 	struct symbol *next;
 };
@@ -46,7 +56,7 @@ static void pushscope(void);
 /* delete the last scope (this pops everything until the next NULL) */
 static void popscope(void);
 /* add a symbol to the list and return a unique identifier */
-static int pushsymbol(char id[MAX_IDENTIFIER_SIZE], struct type t);
+static int pushsymbol(char id[MAX_IDENTIFIER_SIZE], struct type t, int isarray);
 /* return a pointer to the symbol, or NULL if it does not exist */
 static struct symbol *symbolinfo(char id[MAX_IDENTIFIER_SIZE]);
 
@@ -117,7 +127,8 @@ static int isfloat(struct type t);
 
 static void printresultlltype(int nresults, struct type *results);
 static void storei8(int ptr, int idx, char i8);
-static int call(struct function *fn, int nargs, struct expressionresult *args);
+static int call(struct function *fn, int nargs, struct expressionresult *args,
+		int returnsvalue);
 static void cast(struct expressionresult *r, struct expressionresult s,
 		struct type desttyp);
 static void arithbinop(const char *signedinstr, const char *unsignedinstr,
@@ -197,10 +208,37 @@ expression_0 : IDENTIFIER {
 	if (sym == NULL) {
 		yyerror("undefined variable");
 	}
+	if (sym->isarray) {
+		yyerror("arrays aren't first class");
+	}
 	$$.var = varctr++;
 	$$.t = sym->t;
 	printf("\t%%tmp%d = load %s, ptr %%%s%d\n",
 			$$.var, sym->t.lltype, $1, sym->n);
+}
+
+expression_0 : IDENTIFIER '[' expression ']' {
+	int ptr;
+	struct symbol *sym;
+
+	sym = symbolinfo($1);
+	if (sym == NULL) {
+		yyerror("undeclared variable");
+	}
+	if (!sym->isarray) {
+		yyerror("cannot subscript a scalar");
+	}
+	if (isfloat($3.t) || isunsigned($3.t)) {
+		yyerror("subscripts must be signed integers");
+	}
+	ptr = varctr++;
+	$$.var = varctr++;
+	$$.t = sym->t;
+	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, %s %%tmp%d\n",
+			ptr, sym->t.lltype, $1, sym->n, $3.t.lltype, $3.var);
+	printf("\t%%tmp%d = load %s, ptr %%tmp%d\n",
+			$$.var, sym->t.lltype, ptr);
+	
 }
 
 expression_0 : CONSTANT {
@@ -236,7 +274,7 @@ expression_0 : IDENTIFIER '(' expression_nple ')' {
 		yyerror("function result count ≠ 1");
 	}
 	$$.t = node->results[0];
-	$$.var = call(node, narguments, arguments);
+	$$.var = call(node, narguments, arguments, 1);
 }
 
 expression : expression_0 {$$ = $1;}
@@ -275,12 +313,40 @@ expression : IDENTIFIER '=' expression {
 	if (sym == NULL) {
 		yyerror("undeclared variable");
 	}
+	if (sym->isarray) {
+		yyerror("cannot assign an array itself");
+	}
 	if (sym->t.tag != $3.t.tag) {
 		yyerror("type mismatch");
 	}
 	$$ = $3;
 	printf("\tstore %s %%tmp%d, ptr %%%s%d\n",
 			sym->t.lltype, $3.var, $1, sym->n);
+}
+
+expression : IDENTIFIER '[' expression ']' '=' expression {
+	int ptr;
+	struct symbol *sym;
+
+	sym = symbolinfo($1);
+	if (sym == NULL) {
+		yyerror("undeclared variable");
+	}
+	if (!sym->isarray) {
+		yyerror("cannot subscript assign a scalar");
+	}
+	if (sym->t.tag != $6.t.tag) {
+		yyerror("subscript assignment type mismatch");
+	}
+	if (isfloat($3.t) || isunsigned($3.t)) {
+		yyerror("subscripts must be signed integers");
+	}
+	$$ = $3;
+	ptr = varctr++;
+	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, %s %%tmp%d\n",
+			ptr, sym->t.lltype, $1, sym->n, $3.t.lltype, $3.var);
+	printf("\tstore %s %%tmp%d, ptr %%tmp%d\n",
+			sym->t.lltype, $6.var, ptr);
 }
 
 expression_nple : {$$ = NULL;}
@@ -321,7 +387,7 @@ statement : IDENTIFIER '(' expression_nple ')' ';' {
 	if (node->nresults != 0) {
 		yyerror("function result count ≠ 0");
 	}
-	call(node, narguments, arguments);
+	call(node, narguments, arguments, 0);
 }
 
 statement : ident_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
@@ -365,12 +431,15 @@ statement : ident_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
 		if (syms[i] == NULL) {
 			yyerror("undeclared variable");
 		}
+		if (syms[i]->isarray) {
+			yyerror("cannot assign arrays themselves");
+		}
 		if (syms[i]->t.tag != node->results[i].tag) {
 			yyerror("result type mismtach");
 		}
 	}
 	/* write the instructions */
-	agg = call(node, narguments, arguments);
+	agg = call(node, narguments, arguments, 1);
 	for (i = 0; i < nresults; i++) {
 		tmp = varctr++;
 		printf("\t%%tmp%d = extractvalue ", tmp);
@@ -443,8 +512,24 @@ statement : typename IDENTIFIER ';' {
 	if (sym != NULL) {
 		yyerror("already declared");
 	}
-	n = pushsymbol($2, $1);
+	n = pushsymbol($2, $1, 0);
 	printf("\t%%%s%d = alloca %s\n", $2, n, $1.lltype);
+}
+
+statement : typename IDENTIFIER '[' expression ']' ';' {
+	int n;
+	struct symbol *sym;
+
+	sym = symbolinfo($2);
+	if (sym != NULL) {
+		yyerror("already declared");
+	}
+	if (isfloat($4.t) || isunsigned($4.t)) {
+		yyerror("subscripts must be signed integers");
+	}
+	n = pushsymbol($2, $1, 1);
+	printf("\t%%%s%d = alloca %s, %s %%tmp%d\n",
+			$2, n, $1.lltype, $4.t.lltype, $4.var);
 }
 
 statement : PRINTF '(' STRING_LITERAL ',' expression_nple ')' ';' {
@@ -531,7 +616,7 @@ declaration : anon_nple IDENTIFIER '(' named_nple ')' {
 		if (i != 0) {
 			printf(", ");
 		}
-		nums[i] = pushsymbol(names[i], params[i]);
+		nums[i] = pushsymbol(names[i], params[i], 0);
 		printf("%s %%%s%dvar", params[i].lltype, names[i], nums[i]);
 	}
 	printf(") {\n");
@@ -573,7 +658,7 @@ pushscope(void)
 
 	nil[0] = '\0';
 	t.tag = LAST_TYPE;
-	pushsymbol(nil, t);
+	pushsymbol(nil, t, 0);
 }
 
 void
@@ -594,13 +679,14 @@ popscope(void)
 }
 
 int
-pushsymbol(char id[MAX_IDENTIFIER_SIZE], struct type t)
+pushsymbol(char id[MAX_IDENTIFIER_SIZE], struct type t, int isarray)
 {
 	struct symbol *new;
 
 	new = malloc(sizeof(struct symbol));
 	strcpy(new->id, id);
 	new->n = varctr++;
+	new->isarray = isarray;
 	new->t = t;
 	new->next = symbols;
 	symbols = new;
@@ -814,12 +900,19 @@ storei8(int ptr, int idx, char i8)
 }
 
 int
-call(struct function *fn, int nargs, struct expressionresult *args)
+call(struct function *fn, int nargs, struct expressionresult *args,
+		int returnsvalue)
 {
 	int i, result;
 
-	result = varctr++;
-	printf("\t%%tmp%d = call ", result);
+	printf("\t");
+	if (returnsvalue) {
+		result = varctr++;
+		printf("%%tmp%d = ", result);
+	} else {
+		result = -1;
+	}
+	printf("call ");
 	printresultlltype(fn->nresults, fn->results);
 	printf(" @%s(", fn->name);
 	for (i = 0; i < nargs; i++) {

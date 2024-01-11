@@ -18,7 +18,7 @@ static char *strlitptr;
 [ \t\n] ;
 ^#.*$ ;
 
-[(){},;=<>*/%+-] return yytext[0];
+[()\[\]{},;=<>*/%+-] return yytext[0];
 "==" return EQUALEQUAL;
 "!=" return BANGEQUAL;
 "<=" return LESSEQUAL;
