@@ -12,7 +12,6 @@ Feature ideas:
 - multidimensional arrays
 - nested arrays
 - compile-time array bounds checking
-- lvalues
 - function pointers
 - loops can have multiple exits
 
@@ -178,10 +177,10 @@ static void endloop(void);
 %left '*' '/' '%'
 
 %type <type> typename
-%type <expression> expression expression_0
+%type <expression> expression expression_0 lvalue
 %type <typelist> anon_nple anon_nple_nonempty named_nple named_nple_nonempty
-%type <typelist> ident_nple_2plus
 %type <expressionlist> expression_nple expression_nple_nonempty
+%type <expressionlist> lvalue_nple_2plus
 
 %expect 1
 
@@ -201,44 +200,11 @@ expression_0 : '(' expression ')' {
 	$$ = $2;
 }
 
-expression_0 : IDENTIFIER {
-	struct symbol *sym;
-
-	sym = symbolinfo($1);
-	if (sym == NULL) {
-		yyerror("undefined variable");
-	}
-	if (sym->isarray) {
-		yyerror("arrays aren't first class");
-	}
+expression_0 : lvalue {
 	$$.var = varctr++;
-	$$.t = sym->t;
-	printf("\t%%tmp%d = load %s, ptr %%%s%d\n",
-			$$.var, sym->t.lltype, $1, sym->n);
-}
-
-expression_0 : IDENTIFIER '[' expression ']' {
-	int ptr;
-	struct symbol *sym;
-
-	sym = symbolinfo($1);
-	if (sym == NULL) {
-		yyerror("undeclared variable");
-	}
-	if (!sym->isarray) {
-		yyerror("cannot subscript a scalar");
-	}
-	if (isfloat($3.t) || isunsigned($3.t)) {
-		yyerror("subscripts must be signed integers");
-	}
-	ptr = varctr++;
-	$$.var = varctr++;
-	$$.t = sym->t;
-	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, %s %%tmp%d\n",
-			ptr, sym->t.lltype, $1, sym->n, $3.t.lltype, $3.var);
+	$$.t = $1.t;
 	printf("\t%%tmp%d = load %s, ptr %%tmp%d\n",
-			$$.var, sym->t.lltype, ptr);
-	
+			$$.var, $1.t.lltype, $1.var);
 }
 
 expression_0 : CONSTANT {
@@ -306,7 +272,7 @@ expression : expression GREATEREQUAL expression {cmpbinop("ge", &$$, $1, $3);}
 expression : expression '<' expression {cmpbinop("lt", &$$, $1, $3);}
 expression : expression '>' expression {cmpbinop("gt", &$$, $1, $3);}
 
-expression : IDENTIFIER '=' expression {
+lvalue : IDENTIFIER {
 	struct symbol *sym;
 
 	sym = symbolinfo($1);
@@ -316,16 +282,12 @@ expression : IDENTIFIER '=' expression {
 	if (sym->isarray) {
 		yyerror("cannot assign an array itself");
 	}
-	if (sym->t.tag != $3.t.tag) {
-		yyerror("type mismatch");
-	}
-	$$ = $3;
-	printf("\tstore %s %%tmp%d, ptr %%%s%d\n",
-			sym->t.lltype, $3.var, $1, sym->n);
+	$$.var = varctr++;
+	$$.t = sym->t;
+	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, i32 0\n",
+			$$.var, sym->t.lltype, $1, sym->n);
 }
-
-expression : IDENTIFIER '[' expression ']' '=' expression {
-	int ptr;
+lvalue : IDENTIFIER '[' expression ']' {
 	struct symbol *sym;
 
 	sym = symbolinfo($1);
@@ -335,18 +297,22 @@ expression : IDENTIFIER '[' expression ']' '=' expression {
 	if (!sym->isarray) {
 		yyerror("cannot subscript assign a scalar");
 	}
-	if (sym->t.tag != $6.t.tag) {
-		yyerror("subscript assignment type mismatch");
-	}
 	if (isfloat($3.t) || isunsigned($3.t)) {
 		yyerror("subscripts must be signed integers");
 	}
-	$$ = $3;
-	ptr = varctr++;
+	$$.var = varctr++;
+	$$.t = sym->t;
 	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, %s %%tmp%d\n",
-			ptr, sym->t.lltype, $1, sym->n, $3.t.lltype, $3.var);
+			$$.var, sym->t.lltype, $1, sym->n, $3.t.lltype, $3.var);
+}
+
+expression : lvalue '=' expression {
+	if ($1.t.tag != $3.t.tag) {
+		yyerror("type mismatch");
+	}
+	$$ = $3;
 	printf("\tstore %s %%tmp%d, ptr %%tmp%d\n",
-			sym->t.lltype, $6.var, ptr);
+			$1.t.lltype, $3.var, $1.var);
 }
 
 expression_nple : {$$ = NULL;}
@@ -390,7 +356,7 @@ statement : IDENTIFIER '(' expression_nple ')' ';' {
 	call(node, narguments, arguments, 0);
 }
 
-statement : ident_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
+statement : lvalue_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
 	int i;
 	int narguments, nresults;
 	int agg, tmp;
@@ -398,18 +364,12 @@ statement : ident_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
 
 	/* store nples */
 	narguments = expressionlistlen($5);
-	nresults = typelistlen($1);
-	struct expressionresult arguments[narguments];
-	char names[nresults][MAX_IDENTIFIER_SIZE];
+	nresults = expressionlistlen($1);
+	struct expressionresult results[nresults], arguments[narguments];
 	storeexpressionlist($5, arguments);
-	storetypelist($1, NULL, names);
+	storeexpressionlist($1, results);
 	/* get function info */
 	node = functioninfo($3);
-	/* get symbol info */
-	struct symbol *syms[nresults];
-	for (i = 0; i < nresults; i++) {
-		syms[i] = symbolinfo(names[i]);
-	}
 	/* check function */
 	if (node == NULL) {
 		yyerror("undeclared function");
@@ -426,15 +386,9 @@ statement : ident_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
 		yyerror("function result count does not match number of "
 				"identifiers");
 	}
-	/* check symbols */
+	/* check results */
 	for (i = 0; i < nresults; i++) {
-		if (syms[i] == NULL) {
-			yyerror("undeclared variable");
-		}
-		if (syms[i]->isarray) {
-			yyerror("cannot assign arrays themselves");
-		}
-		if (syms[i]->t.tag != node->results[i].tag) {
+		if (results[i].t.tag != node->results[i].tag) {
 			yyerror("result type mismtach");
 		}
 	}
@@ -445,8 +399,8 @@ statement : ident_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
 		printf("\t%%tmp%d = extractvalue ", tmp);
 		printresultlltype(nresults, node->results);
 		printf("%%tmp%d, %d\n", agg, i);
-		printf("\tstore %s %%tmp%d, ptr %%%s%d\n",
-				syms[i]->t.lltype, tmp, names[i], syms[i]->n);
+		printf("\tstore %s %%tmp%d, ptr %%tmp%d\n",
+				results[i].t.lltype, tmp, results[i].var);
 	}
 }
 
@@ -572,12 +526,12 @@ anon_nple_nonempty : anon_nple_nonempty ',' typename {
 	$$ = snoctypelist($1, $3, nil);
 }
 
-ident_nple_2plus : IDENTIFIER ',' IDENTIFIER {
-	$$ = snoctypelist(NULL, u1t, $1);
-	$$ = snoctypelist($$, u1t, $3);
+lvalue_nple_2plus : lvalue ',' lvalue {
+	$$ = snocexpressionlist(NULL, $1.var, $1.t);
+	$$ = snocexpressionlist($$, $3.var, $3.t);
 }
-ident_nple_2plus : ident_nple_2plus ',' IDENTIFIER {
-	$$ = snoctypelist($1, u1t, $3);
+lvalue_nple_2plus : lvalue_nple_2plus ',' lvalue {
+	$$ = snocexpressionlist($1, $3.var, $3.t);
 }
 
 named_nple : U0 {$$ = NULL;}
