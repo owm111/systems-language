@@ -65,6 +65,7 @@ struct function {
 	char name[MAX_IDENTIFIER_SIZE];
 	int nresults, nparams;
 	struct type results[MAX_NPLE_SIZE], params[MAX_NPLE_SIZE];
+	int paramsarearrays[MAX_NPLE_SIZE];
 	struct function *next;
 };
 
@@ -73,7 +74,8 @@ static struct function *functionlist;
 
 /* add a function */
 static void pushfunction(char name[MAX_IDENTIFIER_SIZE], int nresults,
-		struct type *result, int nparams, struct type *param);
+		struct type *result, int nparams, struct type *param,
+		int *paramsarearrays);
 /* look up a function */
 static struct function *functioninfo(char name[MAX_IDENTIFIER_SIZE]);
 
@@ -86,17 +88,17 @@ static struct type rettypes[MAX_NPLE_SIZE];
 
 static int typelistlen(struct typelist *lst);
 static struct typelist *snoctypelist(struct typelist *lst, struct type t,
-		char ident[MAX_IDENTIFIER_SIZE]);
+		char ident[MAX_IDENTIFIER_SIZE], int isarray);
 static void storetypelist(struct typelist *lst, struct type *results,
-		char (*ident)[MAX_IDENTIFIER_SIZE]);
+		char (*ident)[MAX_IDENTIFIER_SIZE], int *arearrays);
 
 /* expression lists */
 
 static int expressionlistlen(struct expressionlist *lst);
 static struct expressionlist *snocexpressionlist(struct expressionlist *lst,
-		int var, struct type t);
+		int var, struct type t, int isarray);
 static void storeexpressionlist(struct expressionlist *lst,
-		struct expressionresult *results);
+		struct expressionresult *results, int *arearrays);
 
 /* stack of labels */
 
@@ -127,7 +129,7 @@ static int isfloat(struct type t);
 static void printresultlltype(int nresults, struct type *results);
 static void storei8(int ptr, int idx, char i8);
 static int call(struct function *fn, int nargs, struct expressionresult *args,
-		int returnsvalue);
+		int *arearrays, int returnsvalue);
 static void cast(struct expressionresult *r, struct expressionresult s,
 		struct type desttyp);
 static void arithbinop(const char *signedinstr, const char *unsignedinstr,
@@ -223,7 +225,8 @@ expression_0 : IDENTIFIER '(' expression_nple ')' {
 
 	narguments = expressionlistlen($3);
 	struct expressionresult arguments[narguments];
-	storeexpressionlist($3, arguments);
+	int arearrays[narguments];
+	storeexpressionlist($3, arguments, arearrays);
 	node = functioninfo($1);
 	if (node == NULL) {
 		yyerror("undeclared function");
@@ -232,6 +235,9 @@ expression_0 : IDENTIFIER '(' expression_nple ')' {
 		yyerror("function argument number mismatch");
 	}
 	for (i = 0; i < narguments; i++) {
+		if (node->paramsarearrays[i] != arearrays[i]) {
+			yyerror("cannot pass scalar as array or vice versa");
+		}
 		if (node->params[i].tag != arguments[i].t.tag) {
 			yyerror("function argument type mismatch");
 		}
@@ -240,7 +246,7 @@ expression_0 : IDENTIFIER '(' expression_nple ')' {
 		yyerror("function result count ≠ 1");
 	}
 	$$.t = node->results[0];
-	$$.var = call(node, narguments, arguments, 1);
+	$$.var = call(node, narguments, arguments, arearrays, 1);
 }
 
 expression : expression_0 {$$ = $1;}
@@ -318,10 +324,42 @@ expression : lvalue '=' expression {
 expression_nple : {$$ = NULL;}
 expression_nple : expression_nple_nonempty {$$ = $1;}
 expression_nple_nonempty : expression {
-	$$ = snocexpressionlist(NULL, $1.var, $1.t);
+	$$ = snocexpressionlist(NULL, $1.var, $1.t, 0);
+}
+expression_nple_nonempty : IDENTIFIER '[' ']' {
+	int ptr;
+	struct symbol *sym;
+
+	sym = symbolinfo($1);
+	if (sym == NULL) {
+		yyerror("undeclared array");
+	}
+	if (!sym->isarray) {
+		yyerror("tried to pass a scalar as an array");
+	}
+	ptr = varctr++;
+	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, i32 0\n",
+			ptr, sym->t.lltype, $1, sym->n);
+	$$ = snocexpressionlist(NULL, ptr, sym->t, 1);
 }
 expression_nple_nonempty : expression_nple_nonempty ',' expression {
-	$$ = snocexpressionlist($1, $3.var, $3.t);
+	$$ = snocexpressionlist($1, $3.var, $3.t, 0);
+}
+expression_nple_nonempty : expression_nple_nonempty ',' IDENTIFIER '[' ']' {
+	int ptr;
+	struct symbol *sym;
+
+	sym = symbolinfo($3);
+	if (sym == NULL) {
+		yyerror("undeclared array");
+	}
+	if (!sym->isarray) {
+		yyerror("tried to pass a scalar as an array");
+	}
+	ptr = varctr++;
+	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, i32 0\n",
+			ptr, sym->t.lltype, $3, sym->n);
+	$$ = snocexpressionlist($1, ptr, sym->t, 1);
 }
 
 statement : '{' {pushscope();} block '}' {popscope();}
@@ -337,7 +375,8 @@ statement : IDENTIFIER '(' expression_nple ')' ';' {
 
 	narguments = expressionlistlen($3);
 	struct expressionresult arguments[narguments];
-	storeexpressionlist($3, arguments);
+	int arearrays[narguments];
+	storeexpressionlist($3, arguments, arearrays);
 	node = functioninfo($1);
 	if (node == NULL) {
 		yyerror("undeclared function");
@@ -346,6 +385,9 @@ statement : IDENTIFIER '(' expression_nple ')' ';' {
 		yyerror("function argument number mismatch");
 	}
 	for (i = 0; i < narguments; i++) {
+		if (node->paramsarearrays[i] != arearrays[i]) {
+			yyerror("cannot pass scalar as array or vice versa");
+		}
 		if (node->params[i].tag != arguments[i].t.tag) {
 			yyerror("function argument type mismatch");
 		}
@@ -353,7 +395,7 @@ statement : IDENTIFIER '(' expression_nple ')' ';' {
 	if (node->nresults != 0) {
 		yyerror("function result count ≠ 0");
 	}
-	call(node, narguments, arguments, 0);
+	call(node, narguments, arguments, arearrays, 0);
 }
 
 statement : lvalue_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
@@ -366,8 +408,9 @@ statement : lvalue_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
 	narguments = expressionlistlen($5);
 	nresults = expressionlistlen($1);
 	struct expressionresult results[nresults], arguments[narguments];
-	storeexpressionlist($5, arguments);
-	storeexpressionlist($1, results);
+	int arearrays[narguments];
+	storeexpressionlist($5, arguments, arearrays);
+	storeexpressionlist($1, results, NULL);
 	/* get function info */
 	node = functioninfo($3);
 	/* check function */
@@ -378,6 +421,9 @@ statement : lvalue_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
 		yyerror("function argument number mismatch");
 	}
 	for (i = 0; i < narguments; i++) {
+		if (node->paramsarearrays[i] != arearrays[i]) {
+			yyerror("cannot pass scalar as array or vice versa");
+		}
 		if (node->params[i].tag != arguments[i].t.tag) {
 			yyerror("function argument type mismatch");
 		}
@@ -393,7 +439,7 @@ statement : lvalue_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
 		}
 	}
 	/* write the instructions */
-	agg = call(node, narguments, arguments, 1);
+	agg = call(node, narguments, arguments, arearrays, 1);
 	for (i = 0; i < nresults; i++) {
 		tmp = varctr++;
 		printf("\t%%tmp%d = extractvalue ", tmp);
@@ -424,7 +470,7 @@ statement : RETURN expression_nple ';' {
 
 	nresults = expressionlistlen($2);
 	struct expressionresult results[nresults];
-	storeexpressionlist($2, results);
+	storeexpressionlist($2, results, NULL);
 	if (nrettypes != nresults) {
 		yyerror("return type count mismatch");
 	}
@@ -492,7 +538,7 @@ statement : PRINTF '(' STRING_LITERAL ',' expression_nple ')' ';' {
 	len = strlen($3);
 	nargs = expressionlistlen($5);
 	struct expressionresult args[nargs];
-	storeexpressionlist($5, args);
+	storeexpressionlist($5, args, NULL);
 	/* store the string literal */
 	strlit = varctr++;
 	printf("\t%%tmp%d = alloca i8, i32 %d\n", strlit, len + 1);
@@ -517,30 +563,36 @@ anon_nple_nonempty : typename {
 	char nil[MAX_IDENTIFIER_SIZE];
 
 	nil[0] = '\0';
-	$$ = snoctypelist(NULL, $1, nil);
+	$$ = snoctypelist(NULL, $1, nil, 0);
 }
 anon_nple_nonempty : anon_nple_nonempty ',' typename {
 	char nil[MAX_IDENTIFIER_SIZE];
 
 	nil[0] = '\0';
-	$$ = snoctypelist($1, $3, nil);
+	$$ = snoctypelist($1, $3, nil, 0);
 }
 
 lvalue_nple_2plus : lvalue ',' lvalue {
-	$$ = snocexpressionlist(NULL, $1.var, $1.t);
-	$$ = snocexpressionlist($$, $3.var, $3.t);
+	$$ = snocexpressionlist(NULL, $1.var, $1.t, 0);
+	$$ = snocexpressionlist($$, $3.var, $3.t, 0);
 }
 lvalue_nple_2plus : lvalue_nple_2plus ',' lvalue {
-	$$ = snocexpressionlist($1, $3.var, $3.t);
+	$$ = snocexpressionlist($1, $3.var, $3.t, 0);
 }
 
 named_nple : U0 {$$ = NULL;}
 named_nple : named_nple_nonempty {$$ = $1;}
 named_nple_nonempty : typename IDENTIFIER {
-	$$ = snoctypelist(NULL, $1, $2);
+	$$ = snoctypelist(NULL, $1, $2, 0);
+}
+named_nple_nonempty : typename IDENTIFIER '[' ']' {
+	$$ = snoctypelist(NULL, $1, $2, 1);
 }
 named_nple_nonempty : named_nple_nonempty ',' typename IDENTIFIER {
-	$$ = snoctypelist($1, $3, $4);
+	$$ = snoctypelist($1, $3, $4, 0);
+}
+named_nple_nonempty : named_nple_nonempty ',' typename IDENTIFIER '[' ']' {
+	$$ = snoctypelist($1, $3, $4, 1);
 }
 
 declaration : anon_nple IDENTIFIER '(' named_nple ')' {
@@ -552,14 +604,15 @@ declaration : anon_nple IDENTIFIER '(' named_nple ')' {
 	nparams = typelistlen($4);
 	struct type params[nparams], results[nresults];
 	char names[nparams][MAX_IDENTIFIER_SIZE];
+	int arearrays[nparams];
 	int nums[nparams];
-	storetypelist($1, results, NULL);
-	storetypelist($4, params, names);
+	storetypelist($1, results, NULL, NULL);
+	storetypelist($4, params, names, arearrays);
 	node = functioninfo($2);
 	if (node != NULL) {
 		yyerror("function redeclared");
 	}
-	pushfunction($2, nresults, results, nparams, params);
+	pushfunction($2, nresults, results, nparams, params, arearrays);
 	pushscope();
 	nrettypes = nresults;
 	memcpy(rettypes, results, sizeof(struct type) * nresults);
@@ -570,11 +623,21 @@ declaration : anon_nple IDENTIFIER '(' named_nple ')' {
 		if (i != 0) {
 			printf(", ");
 		}
-		nums[i] = pushsymbol(names[i], params[i], 0);
-		printf("%s %%%s%dvar", params[i].lltype, names[i], nums[i]);
+		if (arearrays[i]) {
+			/* passing an array */
+			nums[i] = pushsymbol(names[i], params[i], 1);
+			printf("ptr %%%s%d", names[i], nums[i]);
+		} else {
+			/* passing a scalar */
+			nums[i] = pushsymbol(names[i], params[i], 0);
+			printf("%s %%%s%dvar",
+					params[i].lltype, names[i], nums[i]);
+		}
 	}
 	printf(") {\n");
 	for (i = 0; i < nparams; i++) {
+		if (arearrays[i])
+			continue;
 		printf("\t%%%s%d = alloca %s\n",
 				names[i], nums[i], params[i].lltype);
 		printf("\tstore %s %%%s%dvar, ptr %%%s%d\n", params[i].lltype,
@@ -663,7 +726,7 @@ symbolinfo(char id[MAX_IDENTIFIER_SIZE])
 
 void
 pushfunction(char name[MAX_IDENTIFIER_SIZE], int nresults, struct type *results,
-		int nparams, struct type *params)
+		int nparams, struct type *params, int *paramsarearrays)
 {
 	struct function *node;
 
@@ -673,6 +736,7 @@ pushfunction(char name[MAX_IDENTIFIER_SIZE], int nresults, struct type *results,
 	memcpy(node->results, results, sizeof(struct type) * nresults);
 	node->nparams = nparams;
 	memcpy(node->params, params, sizeof(struct type) * nparams);
+	memcpy(node->paramsarearrays, paramsarearrays, sizeof(int) * nparams);
 	node->next = functionlist;
 	functionlist = node;
 }
@@ -745,20 +809,21 @@ typelistlen(struct typelist *lst)
 
 struct typelist *
 snoctypelist(struct typelist *lst, struct type t,
-		char ident[MAX_IDENTIFIER_SIZE])
+		char ident[MAX_IDENTIFIER_SIZE], int isarray)
 {
 	struct typelist *result;
 
 	result = malloc(sizeof(struct typelist));
 	result->next = lst;
 	result->t = t;
+	result->isarray = isarray;
 	strcpy(result->ident, ident);
 	return result;
 }
 
 void
 storetypelist(struct typelist *lst, struct type *results,
-		char (*ident)[MAX_IDENTIFIER_SIZE])
+		char (*ident)[MAX_IDENTIFIER_SIZE], int *arearrays)
 {
 	int len;
 	struct typelist *ptr, *dead;
@@ -773,6 +838,9 @@ storetypelist(struct typelist *lst, struct type *results,
 		}
 		if (ident) {
 			strcpy(ident[len], ptr->ident);
+		}
+		if (arearrays) {
+			arearrays[len] = ptr->isarray;
 		}
 	}
 }
@@ -791,7 +859,8 @@ expressionlistlen(struct expressionlist *lst)
 }
 
 struct expressionlist *
-snocexpressionlist(struct expressionlist *lst, int var, struct type t)
+snocexpressionlist(struct expressionlist *lst, int var, struct type t,
+		int isarray)
 {
 	struct expressionlist *result;
 
@@ -799,12 +868,13 @@ snocexpressionlist(struct expressionlist *lst, int var, struct type t)
 	result->next = lst;
 	result->var = var;
 	result->t = t;
+	result->isarray = isarray;
 	return result;
 }
 
 void
 storeexpressionlist(struct expressionlist *lst,
-		struct expressionresult *results)
+		struct expressionresult *results, int *arearrays)
 {
 	int len;
 	struct expressionlist *ptr, *dead;
@@ -816,6 +886,8 @@ storeexpressionlist(struct expressionlist *lst,
 			dead = ptr, ptr = ptr->next, free(dead), len--) {
 		results[len].var = ptr->var;
 		results[len].t = ptr->t;
+		if (arearrays != NULL)
+			arearrays[len] = ptr->isarray;
 	}
 }
 
@@ -855,7 +927,7 @@ storei8(int ptr, int idx, char i8)
 
 int
 call(struct function *fn, int nargs, struct expressionresult *args,
-		int returnsvalue)
+		int *arearrays, int returnsvalue)
 {
 	int i, result;
 
@@ -873,7 +945,11 @@ call(struct function *fn, int nargs, struct expressionresult *args,
 		if (i != 0) {
 			printf(", ");
 		}
-		printf("%s %%tmp%d", args[i].t.lltype, args[i].var);
+		if (arearrays[i]) {
+			printf("ptr %%tmp%d", args[i].var);
+		} else {
+			printf("%s %%tmp%d", args[i].t.lltype, args[i].var);
+		}
 	}
 	printf(")\n");
 	return result;

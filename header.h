@@ -18,12 +18,14 @@ struct expressionresult {
 struct typelist {
 	struct type t;
 	char ident[MAX_IDENTIFIER_SIZE];
+	int isarray;
 	struct typelist *next;
 };
 
 struct expressionlist {
 	int var;
 	struct type t;
+	int isarray;
 	struct expressionlist *next;
 };
 

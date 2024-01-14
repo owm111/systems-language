@@ -12,10 +12,10 @@ clean:
 
 compiler: compiler.o lexer.o
 
-test-program.ll: test-program.X compiler
+%.ll: %.X compiler
 	./compiler <$< >$@
-test-program: test-program.ll
-	clang $< -o $@
+%: %.ll
+	clang -Wall -g $< -o $@
 
 ignorewarnings = -Wno-missing-braces -Wno-unused-function
 compiler.o: CFLAGS += $(ignorewarnings)
