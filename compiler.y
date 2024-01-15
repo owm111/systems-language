@@ -74,9 +74,8 @@ static struct function functiontable[MAX_FUNCTION_COUNT];
 static int lookupfunction(const char *name);
 
 /* add a function */
-static void pushfunction(char name[MAX_IDENTIFIER_SIZE], int nresults,
-		struct type *result, int nparams, struct type *param,
-		int *paramsarearrays);
+static void pushfunction(char name[MAX_IDENTIFIER_SIZE],
+		int nparams, struct type *param, int *paramsarearrays);
 /* look up a function */
 static struct function *functioninfo(char name[MAX_IDENTIFIER_SIZE]);
 
@@ -177,7 +176,7 @@ static void endloop(void);
 
 %type <type> typename
 %type <expression> expression expression_0 lvalue
-%type <typelist> anon_nple anon_nple_nonempty named_nple named_nple_nonempty
+%type <typelist> named_nple named_nple_nonempty
 %type <expressionlist> expression_nple expression_nple_nonempty
 %type <expressionlist> lvalue_nple_2plus
 
@@ -554,19 +553,14 @@ block : ;
 
 block : block statement;
 
-anon_nple : U0 {$$ = NULL;}
-anon_nple : anon_nple_nonempty {$$ = $1;}
-anon_nple_nonempty : typename {
-	char nil[MAX_IDENTIFIER_SIZE];
-
-	nil[0] = '\0';
-	$$ = snoctypelist(NULL, $1, nil, 0);
+result_nple : U0 {nrettypes = 0;}
+result_nple : nonempty_result_nple ;
+nonempty_result_nple : typename {
+	nrettypes = 1;
+	rettypes[0] = $1;
 }
-anon_nple_nonempty : anon_nple_nonempty ',' typename {
-	char nil[MAX_IDENTIFIER_SIZE];
-
-	nil[0] = '\0';
-	$$ = snoctypelist($1, $3, nil, 0);
+nonempty_result_nple : nonempty_result_nple ',' typename {
+	rettypes[nrettypes++] = $3;
 }
 
 lvalue_nple_2plus : lvalue ',' lvalue {
@@ -592,29 +586,25 @@ named_nple_nonempty : named_nple_nonempty ',' typename IDENTIFIER '[' ']' {
 	$$ = snoctypelist($1, $3, $4, 1);
 }
 
-declaration : anon_nple IDENTIFIER '(' named_nple ')' {
+declaration : result_nple IDENTIFIER '(' named_nple ')' {
 	int i;
-	int nparams, nresults;
+	int nparams;
 	struct function *node;
 
-	nresults = typelistlen($1);
 	nparams = typelistlen($4);
-	struct type params[nparams], results[nresults];
+	struct type params[nparams];
 	char names[nparams][MAX_IDENTIFIER_SIZE];
 	int arearrays[nparams];
 	int nums[nparams];
-	storetypelist($1, results, NULL, NULL);
 	storetypelist($4, params, names, arearrays);
 	node = functioninfo($2);
 	if (node != NULL) {
 		yyerror("function redeclared");
 	}
-	pushfunction($2, nresults, results, nparams, params, arearrays);
+	pushfunction($2, nparams, params, arearrays);
 	pushscope();
-	nrettypes = nresults;
-	memcpy(rettypes, results, sizeof(struct type) * nresults);
 	printf("define ");
-	printresultlltype(nresults, results);
+	printresultlltype(nrettypes, rettypes);
 	printf(" @%s(", $2);
 	for (i = 0; i < nparams; i++) {
 		if (i != 0) {
@@ -794,16 +784,16 @@ lookupfunction(const char *name)
 }
 
 void
-pushfunction(char name[MAX_IDENTIFIER_SIZE], int nresults, struct type *results,
+pushfunction(char name[MAX_IDENTIFIER_SIZE],
 		int nparams, struct type *params, int *paramsarearrays)
 {
 	int idx;
 
 	idx = lookupfunction(name);
 	strcpy(functiontable[idx].name, name);
-	functiontable[idx].nresults = nresults;
-	memcpy(functiontable[idx].results, results,
-			sizeof(struct type) * nresults);
+	functiontable[idx].nresults = nrettypes;
+	memcpy(functiontable[idx].results, rettypes,
+			sizeof(struct type) * nrettypes);
 	functiontable[idx].nparams = nparams;
 	memcpy(functiontable[idx].params, params,
 			sizeof(struct type) * nparams);
