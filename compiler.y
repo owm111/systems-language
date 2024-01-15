@@ -33,6 +33,8 @@ References:
 extern int yylineno;
 extern int yyerror(const char *restrict msg);
 
+static unsigned int mkhash(const char *key);
+
 /* single counter for giving unique names to everything */
 int varctr;
 
@@ -65,11 +67,11 @@ struct function {
 	int nresults, nparams;
 	struct type results[MAX_NPLE_SIZE], params[MAX_NPLE_SIZE];
 	int paramsarearrays[MAX_NPLE_SIZE];
-	struct function *next;
 };
 
-/* currently implemented as an alist */
-static struct function *functionlist;
+/* currently implemented as a hash table */
+static struct function functiontable[MAX_FUNCTION_COUNT];
+static int lookupfunction(const char *name);
 
 /* add a function */
 static void pushfunction(char name[MAX_IDENTIFIER_SIZE], int nresults,
@@ -673,6 +675,56 @@ yyerror(const char *restrict msg)
 	return fprintf(stderr, "line %d: %s\n", yylineno, msg);
 }
 
+/* from http://www.azillionmonkeys.com/qed/hash.html */
+unsigned int
+mkhash(const char *key)
+{
+	int len, rem;
+	unsigned int hash, tmp;
+	const short int *sixteen;
+
+	sixteen = (const short int *)key;
+	len = strlen(key);
+	hash = len;
+	if (len <= 0 || key == NULL)
+		return 0;
+	rem = len & 3;
+	len >>= 2;
+	while (len > 0) {
+		hash += sixteen[0];
+		tmp = (sixteen[1] << 11) ^ hash;
+		hash = (hash << 16) ^ tmp;
+		sixteen = &sixteen[2];
+		hash += hash >> 11;
+		len--;
+	}
+	switch (rem) {
+	case 3:
+		hash += sixteen[0];
+		hash ^= hash << 16;
+		hash ^= key[len - 1] << 18;
+		hash += hash >> 11;
+		break;
+	case 2:
+		hash += sixteen[0];
+		hash ^= hash << 11;
+		hash ^= hash >> 17;
+		break;
+	case 1:
+		hash += key[len - 1];
+		hash ^= hash << 10;
+		hash += hash >> 1;
+		break;
+	}
+	hash ^= hash << 3;
+	hash += hash >> 5;
+	hash ^= hash << 4;
+	hash += hash >> 17;
+	hash ^= hash << 25;
+	hash += hash >> 6;
+	return hash;
+}
+
 void
 pushscope(void)
 {
@@ -730,32 +782,46 @@ symbolinfo(char id[MAX_IDENTIFIER_SIZE])
 	return NULL;
 }
 
+int
+lookupfunction(const char *name)
+{
+	int idx;
+	unsigned int hash;
+
+	hash = mkhash(name);
+	idx = hash % MAX_FUNCTION_COUNT;
+	while (functiontable[idx].name[0] != '\0' &&
+			strcmp(functiontable[idx].name, name) != 0) {
+		idx = (idx + 1) % MAX_FUNCTION_COUNT;
+	}
+	return idx;
+}
+
 void
 pushfunction(char name[MAX_IDENTIFIER_SIZE], int nresults, struct type *results,
 		int nparams, struct type *params, int *paramsarearrays)
 {
-	struct function *node;
+	int idx;
 
-	node = malloc(sizeof(struct function));
-	strcpy(node->name, name);
-	node->nresults = nresults;
-	memcpy(node->results, results, sizeof(struct type) * nresults);
-	node->nparams = nparams;
-	memcpy(node->params, params, sizeof(struct type) * nparams);
-	memcpy(node->paramsarearrays, paramsarearrays, sizeof(int) * nparams);
-	node->next = functionlist;
-	functionlist = node;
+	idx = lookupfunction(name);
+	strcpy(functiontable[idx].name, name);
+	functiontable[idx].nresults = nresults;
+	memcpy(functiontable[idx].results, results,
+			sizeof(struct type) * nresults);
+	functiontable[idx].nparams = nparams;
+	memcpy(functiontable[idx].params, params,
+			sizeof(struct type) * nparams);
+	memcpy(functiontable[idx].paramsarearrays, paramsarearrays,
+			sizeof(int) * nparams);
 }
 
 struct function *
 functioninfo(char name[MAX_IDENTIFIER_SIZE])
 {
-	struct function *node;
+	int idx;
 
-	for (node = functionlist; node != NULL; node = node->next)
-		if (strcmp(node->name, name) == 0)
-			return node;
-	return NULL;
+	idx = lookupfunction(name);
+	return functiontable[idx].name[0] == '\0' ? NULL : &functiontable[idx];
 }
 
 int
