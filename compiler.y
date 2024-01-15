@@ -97,13 +97,16 @@ static struct type rettypes[MAX_NPLE_SIZE];
 static int nparams;
 static struct param params[MAX_NPLE_SIZE];
 
-/* expression lists */
+/* stack of expression results (for fn call args, return stmts, etc.) */
 
-static int expressionlistlen(struct expressionlist *lst);
-static struct expressionlist *snocexpressionlist(struct expressionlist *lst,
-		int var, struct type t, int isarray);
-static void storeexpressionlist(struct expressionlist *lst,
-		struct expressionresult *results, int *arearrays);
+struct expressionresult2 {
+	int var;
+	struct type t;
+	int isarray; /* just adds this */
+};
+
+static struct expressionresult2 expressions[MAX_EXPRESSION_COUNT];
+static int nexpressions;
 
 /* stack of labels */
 
@@ -129,8 +132,8 @@ static int isfloat(struct type t);
 
 static void printresultlltype(int nresults, struct type *results);
 static void storei8(int ptr, int idx, char i8);
-static int call(struct function *fn, int nargs, struct expressionresult *args,
-		int *arearrays, int returnsvalue);
+static int call(struct function *fn, int nargs, struct expressionresult2 *args,
+		int returnsvalue);
 static void cast(struct expressionresult *r, struct expressionresult s,
 		struct type desttyp);
 static void arithbinop(const char *signedinstr, const char *unsignedinstr,
@@ -155,7 +158,7 @@ static void endloop(void);
 	/* parser outputs */
 	struct type type;
 	struct expressionresult expression;
-	struct expressionlist *expressionlist;
+	int expressionlistidx;
 }
 
 %token <identifier> IDENTIFIER
@@ -180,8 +183,8 @@ static void endloop(void);
 
 %type <type> typename
 %type <expression> expression expression_0 lvalue
-%type <expressionlist> expression_nple expression_nple_nonempty
-%type <expressionlist> lvalue_nple_2plus
+%type <expressionlistidx> expression_nple expression_nple_nonempty
+%type <expressionlistidx> lvalue_nple_2plus
 
 %expect 1
 
@@ -219,25 +222,20 @@ expression_0 : CAST '(' expression ',' typename ')' {cast(&$$, $3, $5);}
 
 expression_0 : IDENTIFIER '(' expression_nple ')' {
 	int i;
-	int narguments;
 	struct function *node;
 
-	narguments = expressionlistlen($3);
-	struct expressionresult arguments[narguments];
-	int arearrays[narguments];
-	storeexpressionlist($3, arguments, arearrays);
 	node = functioninfo($1);
 	if (node == NULL) {
 		yyerror("undeclared function");
 	}
-	if (narguments != node->nparams) {
+	if (nexpressions - $3 != node->nparams) {
 		yyerror("function argument number mismatch");
 	}
-	for (i = 0; i < narguments; i++) {
-		if (node->params[i].isarray != arearrays[i]) {
+	for (i = $3; i < nexpressions; i++) {
+		if (node->params[i].isarray != expressions[i].isarray) {
 			yyerror("cannot pass scalar as array or vice versa");
 		}
-		if (node->params[i].type.tag != arguments[i].t.tag) {
+		if (node->params[i].type.tag != expressions[i].t.tag) {
 			yyerror("function argument type mismatch");
 		}
 	}
@@ -245,7 +243,8 @@ expression_0 : IDENTIFIER '(' expression_nple ')' {
 		yyerror("function result count ≠ 1");
 	}
 	$$.t = node->results[0];
-	$$.var = call(node, narguments, arguments, arearrays, 1);
+	$$.var = call(node, nexpressions - $3, &expressions[$3], 1);
+	nexpressions = $3;
 }
 
 expression : expression_0 {$$ = $1;}
@@ -320,10 +319,14 @@ expression : lvalue '=' expression {
 			$1.t.lltype, $3.var, $1.var);
 }
 
-expression_nple : {$$ = NULL;}
+expression_nple : {$$ = nexpressions;}
 expression_nple : expression_nple_nonempty {$$ = $1;}
 expression_nple_nonempty : expression {
-	$$ = snocexpressionlist(NULL, $1.var, $1.t, 0);
+	$$ = nexpressions;
+	expressions[nexpressions].var = $1.var;
+	expressions[nexpressions].t = $1.t;
+	expressions[nexpressions].isarray = 0;
+	nexpressions++;
 }
 expression_nple_nonempty : IDENTIFIER '[' ']' {
 	int ptr;
@@ -339,10 +342,18 @@ expression_nple_nonempty : IDENTIFIER '[' ']' {
 	ptr = varctr++;
 	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, i32 0\n",
 			ptr, sym->t.lltype, $1, sym->n);
-	$$ = snocexpressionlist(NULL, ptr, sym->t, 1);
+	$$ = nexpressions;
+	expressions[nexpressions].var = ptr;
+	expressions[nexpressions].t = sym->t;
+	expressions[nexpressions].isarray = 1;
+	nexpressions++;
 }
 expression_nple_nonempty : expression_nple_nonempty ',' expression {
-	$$ = snocexpressionlist($1, $3.var, $3.t, 0);
+	$$ = $1;
+	expressions[nexpressions].var = $3.var;
+	expressions[nexpressions].t = $3.t;
+	expressions[nexpressions].isarray = 0;
+	nexpressions++;
 }
 expression_nple_nonempty : expression_nple_nonempty ',' IDENTIFIER '[' ']' {
 	int ptr;
@@ -358,7 +369,11 @@ expression_nple_nonempty : expression_nple_nonempty ',' IDENTIFIER '[' ']' {
 	ptr = varctr++;
 	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, i32 0\n",
 			ptr, sym->t.lltype, $3, sym->n);
-	$$ = snocexpressionlist($1, ptr, sym->t, 1);
+	$$ = $1;
+	expressions[nexpressions].var = ptr;
+	expressions[nexpressions].t = sym->t;
+	expressions[nexpressions].isarray = 1;
+	nexpressions++;
 }
 
 statement : '{' {pushscope();} block '}' {popscope();}
@@ -369,84 +384,73 @@ statement : expression ';';
 
 statement : IDENTIFIER '(' expression_nple ')' ';' {
 	int i;
-	int narguments;
 	struct function *node;
 
-	narguments = expressionlistlen($3);
-	struct expressionresult arguments[narguments];
-	int arearrays[narguments];
-	storeexpressionlist($3, arguments, arearrays);
 	node = functioninfo($1);
 	if (node == NULL) {
 		yyerror("undeclared function");
 	}
-	if (narguments != node->nparams) {
+	if (nexpressions - $3 != node->nparams) {
 		yyerror("function argument number mismatch");
 	}
-	for (i = 0; i < narguments; i++) {
-		if (node->params[i].isarray != arearrays[i]) {
+	for (i = $3; i < nexpressions; i++) {
+		if (node->params[i].isarray != expressions[i].isarray) {
 			yyerror("cannot pass scalar as array or vice versa");
 		}
-		if (node->params[i].type.tag != arguments[i].t.tag) {
+		if (node->params[i].type.tag != expressions[i].t.tag) {
 			yyerror("function argument type mismatch");
 		}
 	}
 	if (node->nresults != 0) {
 		yyerror("function result count ≠ 0");
 	}
-	call(node, narguments, arguments, arearrays, 0);
+	call(node, nexpressions - $3, &expressions[$3], 0);
+	nexpressions = $3;
 }
 
 statement : lvalue_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
-	int i;
-	int narguments, nresults;
+	int i, j;
 	int agg, tmp;
 	struct function *node;
 
-	/* store nples */
-	narguments = expressionlistlen($5);
-	nresults = expressionlistlen($1);
-	struct expressionresult results[nresults], arguments[narguments];
-	int arearrays[narguments];
-	storeexpressionlist($5, arguments, arearrays);
-	storeexpressionlist($1, results, NULL);
 	/* get function info */
 	node = functioninfo($3);
 	/* check function */
 	if (node == NULL) {
 		yyerror("undeclared function");
 	}
-	if (narguments != node->nparams) {
+	if (nexpressions - $5 != node->nparams) {
 		yyerror("function argument number mismatch");
 	}
-	for (i = 0; i < narguments; i++) {
-		if (node->params[i].isarray != arearrays[i]) {
+	for (i = $5; i < nexpressions - $5; i++) {
+		if (node->params[i].isarray != expressions[i].isarray) {
 			yyerror("cannot pass scalar as array or vice versa");
 		}
-		if (node->params[i].type.tag != arguments[i].t.tag) {
+		if (node->params[i].type.tag != expressions[i].t.tag) {
 			yyerror("function argument type mismatch");
 		}
 	}
-	if (node->nresults != nresults) {
+	if (node->nresults != $5 - $1) {
 		yyerror("function result count does not match number of "
 				"identifiers");
 	}
 	/* check results */
-	for (i = 0; i < nresults; i++) {
-		if (results[i].t.tag != node->results[i].tag) {
+	for (i = $1; i < $5; i++) {
+		if (expressions[i].t.tag != node->results[i].tag) {
 			yyerror("result type mismtach");
 		}
 	}
 	/* write the instructions */
-	agg = call(node, narguments, arguments, arearrays, 1);
-	for (i = 0; i < nresults; i++) {
+	agg = call(node, nexpressions - $5, &expressions[$5], 1);
+	for (i = $1, j = 0; i < $5; i++, j++) {
 		tmp = varctr++;
 		printf("\t%%tmp%d = extractvalue ", tmp);
-		printresultlltype(nresults, node->results);
-		printf("%%tmp%d, %d\n", agg, i);
+		printresultlltype(node->nresults, node->results);
+		printf("%%tmp%d, %d\n", agg, j);
 		printf("\tstore %s %%tmp%d, ptr %%tmp%d\n",
-				results[i].t.lltype, tmp, results[i].var);
+				expressions[i].t.lltype, tmp, expressions[i].var);
 	}
+	nexpressions = $1;
 }
 
 ifheader : '(' expression ')' {beginconditional($2);}
@@ -465,42 +469,41 @@ statement : WHILE {beginloop();} '(' expression ')' {middleloop($4);} statement 
 }
 
 statement : RETURN expression_nple ';' {
-	int i, nresults, agg, lastagg;
+	int i, j, agg, lastagg;
 
-	nresults = expressionlistlen($2);
-	struct expressionresult results[nresults];
-	storeexpressionlist($2, results, NULL);
-	if (nrettypes != nresults) {
+	if (nrettypes != nexpressions - $2) {
 		yyerror("return type count mismatch");
 	}
-	for (i = 0; i < nresults; i++) {
-		if (results[i].t.tag != rettypes[i].tag) {
+	for (i = $2; i < nexpressions; i++) {
+		if (expressions[i].t.tag != rettypes[i].tag) {
 			yyerror("return type mismatch");
 		}
 	}
-	if (nresults == 0) {
+	if (nexpressions - $2 == 0) {
 		printf("\tret void\n");
-	} else if (nresults == 1) {
+	} else if (nexpressions - $2 == 1) {
 		printf("\tret %s %%tmp%d\n",
-				results[0].t.lltype, results[0].var);
+				expressions[$2].t.lltype, expressions[$2].var);
 	} else {
 		agg = varctr++;
 		printf("\t%%tmp%d = insertvalue ", agg);
-		printresultlltype(nresults, rettypes);
+		printresultlltype(nrettypes, rettypes);
 		printf(" undef, %s %%tmp%d, 0\n",
-				rettypes[0].lltype, results[0].var);
-		for (i = 1, lastagg = agg, agg = varctr++; i < nresults;
-				i++, lastagg = agg, agg = varctr++) {
+				expressions[$2].t.lltype, expressions[$2].var);
+		for (i = $2 + 1, j = 1, lastagg = agg, agg = varctr++;
+				i < nexpressions;
+				i++, j++, lastagg = agg, agg = varctr++) {
 			printf("\t%%tmp%d = insertvalue ", agg);
-			printresultlltype(nresults, rettypes);
+			printresultlltype(nrettypes, rettypes);
 			printf(" %%tmp%d, %s %%tmp%d, %d\n",
-					lastagg, rettypes[i].lltype,
-					results[i].var, i);
+					lastagg, expressions[i].t.lltype,
+					expressions[i].var, j);
 		}
 		printf("\tret ");
-		printresultlltype(nresults, rettypes);
+		printresultlltype(nrettypes, rettypes);
 		printf(" %%tmp%d\n", lastagg);
 	}
+	nexpressions = $2;
 }
 
 statement : typename IDENTIFIER ';' {
@@ -532,12 +535,9 @@ statement : typename IDENTIFIER '[' expression ']' ';' {
 }
 
 statement : PRINTF '(' STRING_LITERAL ',' expression_nple ')' ';' {
-	int i, len, nargs, strlit;
+	int i, len, strlit;
 
 	len = strlen($3);
-	nargs = expressionlistlen($5);
-	struct expressionresult args[nargs];
-	storeexpressionlist($5, args, NULL);
 	/* store the string literal */
 	strlit = varctr++;
 	printf("\t%%tmp%d = alloca i8, i32 %d\n", strlit, len + 1);
@@ -546,10 +546,12 @@ statement : PRINTF '(' STRING_LITERAL ',' expression_nple ')' ';' {
 	storei8(strlit, len, '\0');
 	/* call printf */
 	printf("\tcall i32(ptr, ...) @printf(ptr %%tmp%d", strlit);
-	for (i = 0; i < nargs; i++) {
-		printf(", %s %%tmp%d", args[i].t.lltype, args[i].var);
+	for (i = $5; i < nexpressions; i++) {
+		printf(", %s %%tmp%d", expressions[i].t.lltype,
+				expressions[i].var);
 	}
 	printf(")\n");
+	nexpressions = $5;
 }
 
 block : ;
@@ -567,11 +569,22 @@ nonempty_result_nple : nonempty_result_nple ',' typename {
 }
 
 lvalue_nple_2plus : lvalue ',' lvalue {
-	$$ = snocexpressionlist(NULL, $1.var, $1.t, 0);
-	$$ = snocexpressionlist($$, $3.var, $3.t, 0);
+	$$ = nexpressions;
+	expressions[nexpressions].var = $1.var;
+	expressions[nexpressions].t = $1.t;
+	expressions[nexpressions].isarray = 0;
+	nexpressions++;
+	expressions[nexpressions].var = $3.var;
+	expressions[nexpressions].t = $3.t;
+	expressions[nexpressions].isarray = 0;
+	nexpressions++;
 }
 lvalue_nple_2plus : lvalue_nple_2plus ',' lvalue {
-	$$ = snocexpressionlist($1, $3.var, $3.t, 0);
+	$$ = $1;
+	expressions[nexpressions].var = $3.var;
+	expressions[nexpressions].t = $3.t;
+	expressions[nexpressions].isarray = 0;
+	nexpressions++;
 }
 
 param_nple : U0 {nparams = 0;}
@@ -827,52 +840,6 @@ poplabel(void)
 	return labels[--nlabels];
 }
 
-int
-expressionlistlen(struct expressionlist *lst)
-{
-	int i;
-
-	i = 0;
-	while (lst != NULL) {
-		lst = lst->next;
-		i++;
-	}
-	return i;
-}
-
-struct expressionlist *
-snocexpressionlist(struct expressionlist *lst, int var, struct type t,
-		int isarray)
-{
-	struct expressionlist *result;
-
-	result = malloc(sizeof(struct expressionlist));
-	result->next = lst;
-	result->var = var;
-	result->t = t;
-	result->isarray = isarray;
-	return result;
-}
-
-void
-storeexpressionlist(struct expressionlist *lst,
-		struct expressionresult *results, int *arearrays)
-{
-	int len;
-	struct expressionlist *ptr, *dead;
-
-	if (lst == NULL)
-		return;
-	len = expressionlistlen(lst);
-	for (ptr = lst, len--; ptr != NULL;
-			dead = ptr, ptr = ptr->next, free(dead), len--) {
-		results[len].var = ptr->var;
-		results[len].t = ptr->t;
-		if (arearrays != NULL)
-			arearrays[len] = ptr->isarray;
-	}
-}
-
 void
 printresultlltype(int nresults, struct type *results)
 {
@@ -908,8 +875,8 @@ storei8(int ptr, int idx, char i8)
 }
 
 int
-call(struct function *fn, int nargs, struct expressionresult *args,
-		int *arearrays, int returnsvalue)
+call(struct function *fn, int nargs, struct expressionresult2 *args,
+		int returnsvalue)
 {
 	int i, result;
 
@@ -927,7 +894,7 @@ call(struct function *fn, int nargs, struct expressionresult *args,
 		if (i != 0) {
 			printf(", ");
 		}
-		if (arearrays[i]) {
+		if (args[i].isarray) {
 			printf("ptr %%tmp%d", args[i].var);
 		} else {
 			printf("%s %%tmp%d", args[i].t.lltype, args[i].var);

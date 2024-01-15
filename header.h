@@ -6,6 +6,7 @@
 #define MAX_SCOPE_COUNT 64
 #define MAX_FUNCTION_COUNT 1024
 #define MAX_LABEL_COUNT 64
+#define MAX_EXPRESSION_COUNT 512
 
 enum typetag {U1T, I32T, I64T, U32T, U64T, F32T, F64T, LAST_TYPE};
 
@@ -17,13 +18,6 @@ struct type {
 struct expressionresult {
 	int var;
 	struct type t;
-};
-
-struct expressionlist {
-	int var;
-	struct type t;
-	int isarray;
-	struct expressionlist *next;
 };
 
 extern int yyerror(const char *restrict msg);
