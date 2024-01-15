@@ -62,11 +62,16 @@ static struct symbol *symbolinfo(char id[MAX_IDENTIFIER_SIZE]);
 
 /* list of functions */
 
+struct param {
+	char name[MAX_IDENTIFIER_SIZE];
+	struct type type;
+	int isarray;
+};
 struct function {
 	char name[MAX_IDENTIFIER_SIZE];
 	int nresults, nparams;
-	struct type results[MAX_NPLE_SIZE], params[MAX_NPLE_SIZE];
-	int paramsarearrays[MAX_NPLE_SIZE];
+	struct type results[MAX_NPLE_SIZE];
+	struct param params[MAX_NPLE_SIZE];
 };
 
 /* currently implemented as a hash table */
@@ -74,8 +79,7 @@ static struct function functiontable[MAX_FUNCTION_COUNT];
 static int lookupfunction(const char *name);
 
 /* add a function */
-static void pushfunction(char name[MAX_IDENTIFIER_SIZE],
-		int nparams, struct type *param, int *paramsarearrays);
+static void pushfunction(char name[MAX_IDENTIFIER_SIZE]);
 /* look up a function */
 static struct function *functioninfo(char name[MAX_IDENTIFIER_SIZE]);
 
@@ -83,6 +87,11 @@ static struct function *functioninfo(char name[MAX_IDENTIFIER_SIZE]);
 
 static int nrettypes;
 static struct type rettypes[MAX_NPLE_SIZE];
+
+/* the current function's parameters */
+
+static int nparams;
+static struct param params[MAX_NPLE_SIZE];
 
 /* type lists */
 
@@ -176,7 +185,6 @@ static void endloop(void);
 
 %type <type> typename
 %type <expression> expression expression_0 lvalue
-%type <typelist> named_nple named_nple_nonempty
 %type <expressionlist> expression_nple expression_nple_nonempty
 %type <expressionlist> lvalue_nple_2plus
 
@@ -231,10 +239,10 @@ expression_0 : IDENTIFIER '(' expression_nple ')' {
 		yyerror("function argument number mismatch");
 	}
 	for (i = 0; i < narguments; i++) {
-		if (node->paramsarearrays[i] != arearrays[i]) {
+		if (node->params[i].isarray != arearrays[i]) {
 			yyerror("cannot pass scalar as array or vice versa");
 		}
-		if (node->params[i].tag != arguments[i].t.tag) {
+		if (node->params[i].type.tag != arguments[i].t.tag) {
 			yyerror("function argument type mismatch");
 		}
 	}
@@ -381,10 +389,10 @@ statement : IDENTIFIER '(' expression_nple ')' ';' {
 		yyerror("function argument number mismatch");
 	}
 	for (i = 0; i < narguments; i++) {
-		if (node->paramsarearrays[i] != arearrays[i]) {
+		if (node->params[i].isarray != arearrays[i]) {
 			yyerror("cannot pass scalar as array or vice versa");
 		}
-		if (node->params[i].tag != arguments[i].t.tag) {
+		if (node->params[i].type.tag != arguments[i].t.tag) {
 			yyerror("function argument type mismatch");
 		}
 	}
@@ -417,10 +425,10 @@ statement : lvalue_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
 		yyerror("function argument number mismatch");
 	}
 	for (i = 0; i < narguments; i++) {
-		if (node->paramsarearrays[i] != arearrays[i]) {
+		if (node->params[i].isarray != arearrays[i]) {
 			yyerror("cannot pass scalar as array or vice versa");
 		}
-		if (node->params[i].tag != arguments[i].t.tag) {
+		if (node->params[i].type.tag != arguments[i].t.tag) {
 			yyerror("function argument type mismatch");
 		}
 	}
@@ -571,37 +579,43 @@ lvalue_nple_2plus : lvalue_nple_2plus ',' lvalue {
 	$$ = snocexpressionlist($1, $3.var, $3.t, 0);
 }
 
-named_nple : U0 {$$ = NULL;}
-named_nple : named_nple_nonempty {$$ = $1;}
-named_nple_nonempty : typename IDENTIFIER {
-	$$ = snoctypelist(NULL, $1, $2, 0);
+param_nple : U0 {nparams = 0;}
+param_nple : nonempty_param_nple ;
+nonempty_param_nple : typename IDENTIFIER {
+	nparams = 1;
+	strcpy(params[0].name, $2);
+	params[0].type = $1;
+	params[0].isarray =  0;
 }
-named_nple_nonempty : typename IDENTIFIER '[' ']' {
-	$$ = snoctypelist(NULL, $1, $2, 1);
+nonempty_param_nple : typename IDENTIFIER '[' ']' {
+	nparams = 1;
+	strcpy(params[0].name, $2);
+	params[0].type = $1;
+	params[0].isarray =  1;
 }
-named_nple_nonempty : named_nple_nonempty ',' typename IDENTIFIER {
-	$$ = snoctypelist($1, $3, $4, 0);
+nonempty_param_nple : nonempty_param_nple ',' typename IDENTIFIER {
+	strcpy(params[nparams].name, $4);
+	params[nparams].type = $3;
+	params[nparams].isarray = 0;
+	nparams++;
 }
-named_nple_nonempty : named_nple_nonempty ',' typename IDENTIFIER '[' ']' {
-	$$ = snoctypelist($1, $3, $4, 1);
+nonempty_param_nple : nonempty_param_nple ',' typename IDENTIFIER '[' ']' {
+	strcpy(params[nparams].name, $4);
+	params[nparams].type = $3;
+	params[nparams].isarray = 1;
+	nparams++;
 }
 
-declaration : result_nple IDENTIFIER '(' named_nple ')' {
+declaration : result_nple IDENTIFIER '(' param_nple ')' {
 	int i;
-	int nparams;
 	struct function *node;
 
-	nparams = typelistlen($4);
-	struct type params[nparams];
-	char names[nparams][MAX_IDENTIFIER_SIZE];
-	int arearrays[nparams];
 	int nums[nparams];
-	storetypelist($4, params, names, arearrays);
 	node = functioninfo($2);
 	if (node != NULL) {
 		yyerror("function redeclared");
 	}
-	pushfunction($2, nparams, params, arearrays);
+	pushfunction($2);
 	pushscope();
 	printf("define ");
 	printresultlltype(nrettypes, rettypes);
@@ -610,25 +624,25 @@ declaration : result_nple IDENTIFIER '(' named_nple ')' {
 		if (i != 0) {
 			printf(", ");
 		}
-		if (arearrays[i]) {
+		nums[i] = pushsymbol(params[i].name, params[i].type,
+				params[i].isarray);
+		if (params[i].isarray) {
 			/* passing an array */
-			nums[i] = pushsymbol(names[i], params[i], 1);
-			printf("ptr %%%s%d", names[i], nums[i]);
+			printf("ptr %%%s%d", params[i].name, nums[i]);
 		} else {
 			/* passing a scalar */
-			nums[i] = pushsymbol(names[i], params[i], 0);
-			printf("%s %%%s%dvar",
-					params[i].lltype, names[i], nums[i]);
+			printf("%s %%%s%dvar", params[i].type.lltype,
+					params[i].name, nums[i]);
 		}
 	}
 	printf(") {\n");
 	for (i = 0; i < nparams; i++) {
-		if (arearrays[i])
+		if (params[i].isarray)
 			continue;
 		printf("\t%%%s%d = alloca %s\n",
-				names[i], nums[i], params[i].lltype);
-		printf("\tstore %s %%%s%dvar, ptr %%%s%d\n", params[i].lltype,
-				names[i], nums[i], names[i], nums[i]);
+				params[i].name, nums[i], params[i].type.lltype);
+		printf("\tstore %s %%%s%dvar, ptr %%%s%d\n", params[i].type.lltype,
+				params[i].name, nums[i], params[i].name, nums[i]);
 	}
 } '{' block '}' {
 	if (nrettypes == 0) {
@@ -784,8 +798,7 @@ lookupfunction(const char *name)
 }
 
 void
-pushfunction(char name[MAX_IDENTIFIER_SIZE],
-		int nparams, struct type *params, int *paramsarearrays)
+pushfunction(char name[MAX_IDENTIFIER_SIZE])
 {
 	int idx;
 
@@ -796,9 +809,7 @@ pushfunction(char name[MAX_IDENTIFIER_SIZE],
 			sizeof(struct type) * nrettypes);
 	functiontable[idx].nparams = nparams;
 	memcpy(functiontable[idx].params, params,
-			sizeof(struct type) * nparams);
-	memcpy(functiontable[idx].paramsarearrays, paramsarearrays,
-			sizeof(int) * nparams);
+			sizeof(struct param) * nparams);
 }
 
 struct function *
