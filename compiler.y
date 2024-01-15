@@ -107,13 +107,9 @@ static void storeexpressionlist(struct expressionlist *lst,
 actions */
 
 /* only stores the number in the label's name */
-struct labelnode {
-	int n;
-	struct labelnode *next;
-};
-
-/* currently implemented as a linked list */
-static struct labelnode *labelstack;
+/* currently implemented as an array that contains a stack */
+static int labels[MAX_LABEL_COUNT];
+static int nlabels;
 
 static void pushlabel(int);
 static int poplabel(void);
@@ -847,27 +843,13 @@ binop(const char *restrict instr, YYSTYPE r, YYSTYPE s, YYSTYPE t)
 void
 pushlabel(int n)
 {
-	struct labelnode *l;
-
-	l = malloc(sizeof(struct labelnode));
-	l->n = n;
-	l->next = labelstack;
-	labelstack = l;
+	labels[nlabels++] = n;
 }
 
 int
 poplabel(void)
 {
-	int n;
-	struct labelnode *l;
-
-	if (labelstack == NULL)
-		return -1;
-	l = labelstack;
-	n = l->n;
-	labelstack = l->next;
-	free(l);
-	return n;
+	return labels[--nlabels];
 }
 
 int
