@@ -3,7 +3,6 @@ Current problems:
 - error handling is bad
 - all constants need to be explicitly cast
 - the source code is just messy
-- returns from u0 functions must be explicit
 - casting to/from booleans: should it be "smart?"
 
 Feature ideas:
@@ -644,6 +643,13 @@ declaration : anon_nple IDENTIFIER '(' named_nple ')' {
 				names[i], nums[i], names[i], nums[i]);
 	}
 } '{' block '}' {
+	if (nrettypes == 0) {
+		printf("\tret void\n");
+	} else {
+		printf("\tret ");
+		printresultlltype(nrettypes, rettypes);
+		printf(" undef\n");
+	}
 	popscope();
 	printf("}\n");
 }
