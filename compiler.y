@@ -40,16 +40,20 @@ int varctr;
 
 /* symbol table */
 
+/* a hash table would probably be faster in theory, but i'm not sure
+how to deal with shadowing using a hash table but not using a stack or
+two to track scopes */
+
 struct symbol {
 	char id[MAX_IDENTIFIER_SIZE]; /* actual name in user code */
 	int n; /* unique identifier to avoid capturing */
 	int isarray;
 	struct type t;
-	struct symbol *next;
 };
 
-/* currently implemented as an alist */
-static struct symbol *symbols;
+/* currently implemented an array that stores a stack */
+static struct symbol symbols[MAX_SYMBOL_COUNT];
+static int nsymbols;
 
 /* create a new scope (this pushes a symbol NULL to the list) */
 static void pushscope(void);
@@ -719,58 +723,37 @@ mkhash(const char *key)
 void
 pushscope(void)
 {
-	char nil[MAX_IDENTIFIER_SIZE];
-	struct type t;
-
-	nil[0] = '\0';
-	t.tag = LAST_TYPE;
-	pushsymbol(nil, t, 0);
+	symbols[nsymbols++].id[0] = '\0';
 }
 
 void
 popscope(void)
 {
-	struct symbol *ptr, *dead;
-
-	ptr = symbols;
-	while (ptr != NULL && ptr->id[0] != '\0') {
-		dead = ptr;
-		ptr = ptr->next;
-		free(dead);
-	}
-	if (ptr == NULL)
-		return;
-	symbols = ptr->next;
-	free(ptr);
+	while (symbols[nsymbols - 1].id[0] != '\0')
+		nsymbols--;
+	nsymbols--;
 }
 
 int
 pushsymbol(char id[MAX_IDENTIFIER_SIZE], struct type t, int isarray)
 {
-	struct symbol *new;
+	int idx;
 
-	new = malloc(sizeof(struct symbol));
-	strcpy(new->id, id);
-	new->n = varctr++;
-	new->isarray = isarray;
-	new->t = t;
-	new->next = symbols;
-	symbols = new;
-	return new->n;
+	idx = nsymbols++;
+	strcpy(symbols[idx].id, id);
+	symbols[idx].isarray = isarray;
+	symbols[idx].t = t;
+	return symbols[idx].n = varctr++;
 }
 
 struct symbol *
 symbolinfo(char id[MAX_IDENTIFIER_SIZE])
 {
-	struct symbol *ptr;
+	int idx;
 
-	for (ptr = symbols; ptr != NULL; ptr = ptr->next) {
-		if (ptr->id[0] == '\0')
-			continue;
-		if (strcmp(ptr->id, id) == 0)
-			return ptr;
-	}
-	return NULL;
+	for (idx = nsymbols - 1; idx >= 0 && strcmp(symbols[idx].id, id) != 0;
+			idx--);
+	return idx < 0 ? NULL : &symbols[idx];
 }
 
 int
