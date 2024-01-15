@@ -93,14 +93,6 @@ static struct type rettypes[MAX_NPLE_SIZE];
 static int nparams;
 static struct param params[MAX_NPLE_SIZE];
 
-/* type lists */
-
-static int typelistlen(struct typelist *lst);
-static struct typelist *snoctypelist(struct typelist *lst, struct type t,
-		char ident[MAX_IDENTIFIER_SIZE], int isarray);
-static void storetypelist(struct typelist *lst, struct type *results,
-		char (*ident)[MAX_IDENTIFIER_SIZE], int *arearrays);
-
 /* expression lists */
 
 static int expressionlistlen(struct expressionlist *lst);
@@ -160,7 +152,6 @@ static void endloop(void);
 	struct type type;
 	struct expressionresult expression;
 	struct expressionlist *expressionlist;
-	struct typelist *typelist;
 }
 
 %token <identifier> IDENTIFIER
@@ -851,53 +842,6 @@ int
 poplabel(void)
 {
 	return labels[--nlabels];
-}
-
-int
-typelistlen(struct typelist *lst)
-{
-	int i;
-
-	for (i = 0; lst != NULL; lst = lst->next, i++);
-	return i;
-}
-
-struct typelist *
-snoctypelist(struct typelist *lst, struct type t,
-		char ident[MAX_IDENTIFIER_SIZE], int isarray)
-{
-	struct typelist *result;
-
-	result = malloc(sizeof(struct typelist));
-	result->next = lst;
-	result->t = t;
-	result->isarray = isarray;
-	strcpy(result->ident, ident);
-	return result;
-}
-
-void
-storetypelist(struct typelist *lst, struct type *results,
-		char (*ident)[MAX_IDENTIFIER_SIZE], int *arearrays)
-{
-	int len;
-	struct typelist *ptr, *dead;
-
-	if (lst == NULL)
-		return;
-	len = typelistlen(lst);
-	for (ptr = lst, len--; ptr != NULL;
-			dead = ptr, ptr = ptr->next, free(dead), len--) {
-		if (results) {
-			results[len] = ptr->t;
-		}
-		if (ident) {
-			strcpy(ident[len], ptr->ident);
-		}
-		if (arearrays) {
-			arearrays[len] = ptr->isarray;
-		}
-	}
 }
 
 int
