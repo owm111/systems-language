@@ -7,9 +7,10 @@ Current problems:
 
 Feature ideas:
 - detect functions that do not return
-- first-class arrays
-- multidimensional arrays
-- nested arrays
+- structure types
+- union types
+- array size given by expressions
+- array slicing
 - compile-time array bounds checking
 - function pointers
 - loops can have multiple exits
@@ -47,7 +48,6 @@ two to track scopes */
 struct symbol {
 	char id[MAX_IDENTIFIER_SIZE]; /* actual name in user code */
 	int n; /* unique identifier to avoid capturing */
-	int isarray;
 	struct type t;
 };
 
@@ -60,7 +60,7 @@ static void pushscope(void);
 /* delete the last scope (this pops everything until the next NULL) */
 static void popscope(void);
 /* add a symbol to the list and return a unique identifier */
-static int pushsymbol(char id[MAX_IDENTIFIER_SIZE], struct type t, int isarray);
+static int pushsymbol(char id[MAX_IDENTIFIER_SIZE], struct type t);
 /* return a pointer to the symbol, or NULL if it does not exist */
 static struct symbol *symbolinfo(char id[MAX_IDENTIFIER_SIZE]);
 
@@ -69,7 +69,6 @@ static struct symbol *symbolinfo(char id[MAX_IDENTIFIER_SIZE]);
 struct param {
 	char name[MAX_IDENTIFIER_SIZE];
 	struct type type;
-	int isarray;
 };
 struct function {
 	char name[MAX_IDENTIFIER_SIZE];
@@ -99,14 +98,21 @@ static struct param params[MAX_NPLE_SIZE];
 
 /* stack of expression results (for fn call args, return stmts, etc.) */
 
-struct expressionresult2 {
-	int var;
-	struct type t;
-	int isarray; /* just adds this */
-};
-
-static struct expressionresult2 expressions[MAX_EXPRESSION_COUNT];
+static struct expressionresult expressions[MAX_EXPRESSION_COUNT];
 static int nexpressions;
+
+/* Expressions and Lvalues */
+
+/*
+Expressions and lvalues are passed around by the name of a temporary
+variable and their type. What that temporary variable contains is
+determined by its type and where it is used.
+
+- Lvalues for base types store a pointer to the actual value.
+- Lvalues for array references store the pointer to the array.
+- Expressions for base types store the value itself.
+- Expressions for array references store the pointer to the array.
+*/
 
 /* stack of labels */
 
@@ -123,6 +129,10 @@ static int poplabel(void);
 
 /* utilities for working with types */
 
+/* are these types the same? */
+static int aretypesequal(struct type t1, struct type t2);
+/* is this an array reference type? */
+static int isarrayref(struct type t);
 /* is this an unsigned, integral type? */
 static int isunsigned(struct type t);
 /* is this a floating-point, numeric type? */
@@ -132,7 +142,7 @@ static int isfloat(struct type t);
 
 static void printresultlltype(int nresults, struct type *results);
 static void storei8(int ptr, int idx, char i8);
-static int call(struct function *fn, int nargs, struct expressionresult2 *args,
+static int call(struct function *fn, int nargs, struct expressionresult *args,
 		int returnsvalue);
 static void cast(struct expressionresult *r, struct expressionresult s,
 		struct type desttyp);
@@ -157,6 +167,7 @@ static void endloop(void);
 	long int constant;
 	/* parser outputs */
 	struct type type;
+	int arrayspec[MAX_ARRAY_DIMS];
 	struct expressionresult expression;
 	int expressionlistidx;
 }
@@ -166,6 +177,7 @@ static void endloop(void);
 %token <strlit> STRING_LITERAL
 /* types */
 %token U0 U1 I32 I64 U32 U64 F32 F64
+%token REF
 /* expressions */
 %token CAST
 %token PRINTF
@@ -181,7 +193,8 @@ static void endloop(void);
 %left '+' '-'
 %left '*' '/' '%'
 
-%type <type> typename
+%type <type> basetype typename
+%type <arrayspec> arrayspec
 %type <expression> expression expression_0 lvalue
 %type <expressionlistidx> expression_nple expression_nple_nonempty
 %type <expressionlistidx> lvalue_nple_2plus
@@ -192,29 +205,94 @@ static void endloop(void);
 
 %%
 
-typename : U1  {$$ = u1t;}
-typename : I32 {$$ = i32t;}
-typename : I64 {$$ = i64t;}
-typename : U32 {$$ = u32t;}
-typename : U64 {$$ = u64t;}
-typename : F32 {$$ = f32t;}
-typename : F64 {$$ = f64t;}
+basetype : U1  {$$ = u1t;}
+basetype : I32 {$$ = i32t;}
+basetype : I64 {$$ = i64t;}
+basetype : U32 {$$ = u32t;}
+basetype : U64 {$$ = u64t;}
+basetype : F32 {$$ = f32t;}
+basetype : F64 {$$ = f64t;}
+
+arrayspec : '[' CONSTANT ']' {
+	int i;
+
+	$$[0] = $2;
+	for (i = 1; i < MAX_ARRAY_DIMS; i++)
+		$$[i] = 0;
+}
+arrayspec : arrayspec '[' CONSTANT ']' {
+	int i;
+
+	for (i = 0; $1[i] != 0; i++)
+		$$[i] = $1[i];
+	$$[i++] = $3;
+	for (; i < MAX_ARRAY_DIMS; i++)
+		$$[i] = 0;
+}
+
+typename : basetype {$$ = $1;}
+typename : REF basetype arrayspec {
+	int i;
+
+	$$ = $2;
+	for (i = 0; i < MAX_ARRAY_DIMS; i++)
+		$$.dimension[i] = $3[i];
+}
+
+lvalue : IDENTIFIER {
+	struct symbol *sym;
+
+	sym = symbolinfo($1);
+	if (sym == NULL) {
+		yyerror("undeclared variable");
+	}
+	$$.var = varctr++;
+	$$.t = sym->t;
+	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, i32 0\n",
+			$$.var, sym->t.lltype, $1, sym->n);
+}
+lvalue : expression_0 '[' expression ']' {
+	int i, remainingproduct, tmp;
+
+	if (!isarrayref($1.t)) {
+		yyerror("cannot subscript assign a scalar");
+	}
+	if (isfloat($3.t) || isunsigned($3.t)) {
+		yyerror("subscripts must be signed integers");
+	}
+	$$.var = varctr++;
+	$$.t = $1.t;
+	for (i = 1; i < MAX_ARRAY_DIMS; i++)
+		$$.t.dimension[i - 1] = $$.t.dimension[i];
+	$$.t.dimension[MAX_ARRAY_DIMS - 1] = 0;
+	remainingproduct = 1;
+	for (i = 0; $$.t.dimension[i] != 0; i++)
+		remainingproduct *= $$.t.dimension[i];
+	tmp = varctr++;
+	printf("\t%%tmp%d = mul %s %%tmp%d, %d\n",
+			tmp, $3.t.lltype, $3.var, remainingproduct);
+	printf("\t%%tmp%d = getelementptr %s, ptr %%tmp%d, %s %%tmp%d\n",
+			$$.var, $1.t.lltype, $1.var, $3.t.lltype, tmp);
+}
 
 expression_0 : '(' expression ')' {
 	$$ = $2;
 }
 
 expression_0 : lvalue {
-	$$.var = varctr++;
-	$$.t = $1.t;
-	printf("\t%%tmp%d = load %s, ptr %%tmp%d\n",
-			$$.var, $1.t.lltype, $1.var);
+	if (isarrayref($1.t)) {
+		$$ = $1;
+	} else {
+		$$.var = varctr++;
+		$$.t = $1.t;
+		printf("\t%%tmp%d = load %s, ptr %%tmp%d\n",
+				$$.var, $1.t.lltype, $1.var);
+	}
 }
 
 expression_0 : CONSTANT {
 	$$.var = varctr++;
 	$$.t = i64t;
-	strcpy($$.t.lltype, "i64");
 	printf("\t%%tmp%d = add %s %lu, 0\n", $$.var, $$.t.lltype, $1);
 }
 
@@ -232,10 +310,7 @@ expression_0 : IDENTIFIER '(' expression_nple ')' {
 		yyerror("function argument number mismatch");
 	}
 	for (i = $3; i < nexpressions; i++) {
-		if (node->params[i].isarray != expressions[i].isarray) {
-			yyerror("cannot pass scalar as array or vice versa");
-		}
-		if (node->params[i].type.tag != expressions[i].t.tag) {
+		if (!aretypesequal(node->params[i].type, expressions[i].t)) {
 			yyerror("function argument type mismatch");
 		}
 	}
@@ -276,43 +351,12 @@ expression : expression GREATEREQUAL expression {cmpbinop("ge", &$$, $1, $3);}
 expression : expression '<' expression {cmpbinop("lt", &$$, $1, $3);}
 expression : expression '>' expression {cmpbinop("gt", &$$, $1, $3);}
 
-lvalue : IDENTIFIER {
-	struct symbol *sym;
-
-	sym = symbolinfo($1);
-	if (sym == NULL) {
-		yyerror("undeclared variable");
-	}
-	if (sym->isarray) {
-		yyerror("cannot assign an array itself");
-	}
-	$$.var = varctr++;
-	$$.t = sym->t;
-	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, i32 0\n",
-			$$.var, sym->t.lltype, $1, sym->n);
-}
-lvalue : IDENTIFIER '[' expression ']' {
-	struct symbol *sym;
-
-	sym = symbolinfo($1);
-	if (sym == NULL) {
-		yyerror("undeclared variable");
-	}
-	if (!sym->isarray) {
-		yyerror("cannot subscript assign a scalar");
-	}
-	if (isfloat($3.t) || isunsigned($3.t)) {
-		yyerror("subscripts must be signed integers");
-	}
-	$$.var = varctr++;
-	$$.t = sym->t;
-	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, %s %%tmp%d\n",
-			$$.var, sym->t.lltype, $1, sym->n, $3.t.lltype, $3.var);
-}
-
 expression : lvalue '=' expression {
-	if ($1.t.tag != $3.t.tag) {
+	if (!aretypesequal($1.t, $3.t)) {
 		yyerror("type mismatch");
+	}
+	if (isarrayref($1.t)) {
+		yyerror("cannot assign array references");
 	}
 	$$ = $3;
 	printf("\tstore %s %%tmp%d, ptr %%tmp%d\n",
@@ -325,54 +369,12 @@ expression_nple_nonempty : expression {
 	$$ = nexpressions;
 	expressions[nexpressions].var = $1.var;
 	expressions[nexpressions].t = $1.t;
-	expressions[nexpressions].isarray = 0;
-	nexpressions++;
-}
-expression_nple_nonempty : IDENTIFIER '[' ']' {
-	int ptr;
-	struct symbol *sym;
-
-	sym = symbolinfo($1);
-	if (sym == NULL) {
-		yyerror("undeclared array");
-	}
-	if (!sym->isarray) {
-		yyerror("tried to pass a scalar as an array");
-	}
-	ptr = varctr++;
-	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, i32 0\n",
-			ptr, sym->t.lltype, $1, sym->n);
-	$$ = nexpressions;
-	expressions[nexpressions].var = ptr;
-	expressions[nexpressions].t = sym->t;
-	expressions[nexpressions].isarray = 1;
 	nexpressions++;
 }
 expression_nple_nonempty : expression_nple_nonempty ',' expression {
 	$$ = $1;
 	expressions[nexpressions].var = $3.var;
 	expressions[nexpressions].t = $3.t;
-	expressions[nexpressions].isarray = 0;
-	nexpressions++;
-}
-expression_nple_nonempty : expression_nple_nonempty ',' IDENTIFIER '[' ']' {
-	int ptr;
-	struct symbol *sym;
-
-	sym = symbolinfo($3);
-	if (sym == NULL) {
-		yyerror("undeclared array");
-	}
-	if (!sym->isarray) {
-		yyerror("tried to pass a scalar as an array");
-	}
-	ptr = varctr++;
-	printf("\t%%tmp%d = getelementptr %s, ptr %%%s%d, i32 0\n",
-			ptr, sym->t.lltype, $3, sym->n);
-	$$ = $1;
-	expressions[nexpressions].var = ptr;
-	expressions[nexpressions].t = sym->t;
-	expressions[nexpressions].isarray = 1;
 	nexpressions++;
 }
 
@@ -394,10 +396,7 @@ statement : IDENTIFIER '(' expression_nple ')' ';' {
 		yyerror("function argument number mismatch");
 	}
 	for (i = $3; i < nexpressions; i++) {
-		if (node->params[i].isarray != expressions[i].isarray) {
-			yyerror("cannot pass scalar as array or vice versa");
-		}
-		if (node->params[i].type.tag != expressions[i].t.tag) {
+		if (!aretypesequal(node->params[i].type, expressions[i].t)) {
 			yyerror("function argument type mismatch");
 		}
 	}
@@ -423,10 +422,7 @@ statement : lvalue_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
 		yyerror("function argument number mismatch");
 	}
 	for (i = $5; i < nexpressions - $5; i++) {
-		if (node->params[i].isarray != expressions[i].isarray) {
-			yyerror("cannot pass scalar as array or vice versa");
-		}
-		if (node->params[i].type.tag != expressions[i].t.tag) {
+		if (!aretypesequal(node->params[i].type, expressions[i].t)) {
 			yyerror("function argument type mismatch");
 		}
 	}
@@ -436,7 +432,7 @@ statement : lvalue_nple_2plus '=' IDENTIFIER '(' expression_nple ')' ';' {
 	}
 	/* check results */
 	for (i = $1; i < $5; i++) {
-		if (expressions[i].t.tag != node->results[i].tag) {
+		if (!aretypesequal(expressions[i].t, node->results[i])) {
 			yyerror("result type mismtach");
 		}
 	}
@@ -475,7 +471,7 @@ statement : RETURN expression_nple ';' {
 		yyerror("return type count mismatch");
 	}
 	for (i = $2; i < nexpressions; i++) {
-		if (expressions[i].t.tag != rettypes[i].tag) {
+		if (!aretypesequal(expressions[i].t, rettypes[i])) {
 			yyerror("return type mismatch");
 		}
 	}
@@ -506,6 +502,11 @@ statement : RETURN expression_nple ';' {
 	nexpressions = $2;
 }
 
+/*
+The first form declares a scalar identifier, while the second form
+declares an array. The second form produces an array reference.
+*/
+
 statement : typename IDENTIFIER ';' {
 	int n;
 	struct symbol *sym;
@@ -514,24 +515,25 @@ statement : typename IDENTIFIER ';' {
 	if (sym != NULL) {
 		yyerror("already declared");
 	}
-	n = pushsymbol($2, $1, 0);
+	n = pushsymbol($2, $1);
 	printf("\t%%%s%d = alloca %s\n", $2, n, $1.lltype);
 }
 
-statement : typename IDENTIFIER '[' expression ']' ';' {
-	int n;
+statement : typename IDENTIFIER arrayspec ';' {
+	int i, n, product;
 	struct symbol *sym;
 
 	sym = symbolinfo($2);
 	if (sym != NULL) {
 		yyerror("already declared");
 	}
-	if (isfloat($4.t) || isunsigned($4.t)) {
-		yyerror("subscripts must be signed integers");
+	for (i = 0, product = 1; $3[i] != 0; i++) {
+		product *= $3[i];
+		$1.dimension[i] = $3[i];
 	}
-	n = pushsymbol($2, $1, 1);
-	printf("\t%%%s%d = alloca %s, %s %%tmp%d\n",
-			$2, n, $1.lltype, $4.t.lltype, $4.var);
+	n = pushsymbol($2, $1);
+	printf("\t%%%s%d = alloca %s, i32 %d\n",
+			$2, n, $1.lltype, product);
 }
 
 statement : PRINTF '(' STRING_LITERAL ',' expression_nple ')' ';' {
@@ -560,11 +562,11 @@ block : block statement;
 
 result_nple : U0 {nrettypes = 0;}
 result_nple : nonempty_result_nple ;
-nonempty_result_nple : typename {
+nonempty_result_nple : basetype {
 	nrettypes = 1;
 	rettypes[0] = $1;
 }
-nonempty_result_nple : nonempty_result_nple ',' typename {
+nonempty_result_nple : nonempty_result_nple ',' basetype {
 	rettypes[nrettypes++] = $3;
 }
 
@@ -572,18 +574,15 @@ lvalue_nple_2plus : lvalue ',' lvalue {
 	$$ = nexpressions;
 	expressions[nexpressions].var = $1.var;
 	expressions[nexpressions].t = $1.t;
-	expressions[nexpressions].isarray = 0;
 	nexpressions++;
 	expressions[nexpressions].var = $3.var;
 	expressions[nexpressions].t = $3.t;
-	expressions[nexpressions].isarray = 0;
 	nexpressions++;
 }
 lvalue_nple_2plus : lvalue_nple_2plus ',' lvalue {
 	$$ = $1;
 	expressions[nexpressions].var = $3.var;
 	expressions[nexpressions].t = $3.t;
-	expressions[nexpressions].isarray = 0;
 	nexpressions++;
 }
 
@@ -593,24 +592,10 @@ nonempty_param_nple : typename IDENTIFIER {
 	nparams = 1;
 	strcpy(params[0].name, $2);
 	params[0].type = $1;
-	params[0].isarray =  0;
-}
-nonempty_param_nple : typename IDENTIFIER '[' ']' {
-	nparams = 1;
-	strcpy(params[0].name, $2);
-	params[0].type = $1;
-	params[0].isarray =  1;
 }
 nonempty_param_nple : nonempty_param_nple ',' typename IDENTIFIER {
 	strcpy(params[nparams].name, $4);
 	params[nparams].type = $3;
-	params[nparams].isarray = 0;
-	nparams++;
-}
-nonempty_param_nple : nonempty_param_nple ',' typename IDENTIFIER '[' ']' {
-	strcpy(params[nparams].name, $4);
-	params[nparams].type = $3;
-	params[nparams].isarray = 1;
 	nparams++;
 }
 
@@ -632,10 +617,9 @@ declaration : result_nple IDENTIFIER '(' param_nple ')' {
 		if (i != 0) {
 			printf(", ");
 		}
-		nums[i] = pushsymbol(params[i].name, params[i].type,
-				params[i].isarray);
-		if (params[i].isarray) {
-			/* passing an array */
+		nums[i] = pushsymbol(params[i].name, params[i].type);
+		if (isarrayref(params[i].type)) {
+			/* passing an array reference */
 			printf("ptr %%%s%d", params[i].name, nums[i]);
 		} else {
 			/* passing a scalar */
@@ -645,7 +629,7 @@ declaration : result_nple IDENTIFIER '(' param_nple ')' {
 	}
 	printf(") {\n");
 	for (i = 0; i < nparams; i++) {
-		if (params[i].isarray)
+		if (isarrayref(params[i].type))
 			continue;
 		printf("\t%%%s%d = alloca %s\n",
 				params[i].name, nums[i], params[i].type.lltype);
@@ -748,13 +732,12 @@ popscope(void)
 }
 
 int
-pushsymbol(char id[MAX_IDENTIFIER_SIZE], struct type t, int isarray)
+pushsymbol(char id[MAX_IDENTIFIER_SIZE], struct type t)
 {
 	int idx;
 
 	idx = nsymbols++;
 	strcpy(symbols[idx].id, id);
-	symbols[idx].isarray = isarray;
 	symbols[idx].t = t;
 	return symbols[idx].n = varctr++;
 }
@@ -809,15 +792,36 @@ functioninfo(char name[MAX_IDENTIFIER_SIZE])
 }
 
 int
+aretypesequal(struct type t1, struct type t2)
+{
+	int i;
+
+	if (t1.tag != t2.tag)
+		return 0;
+	for (i = 0; i < MAX_ARRAY_DIMS; i++) {
+		if (t1.dimension[i] != t2.dimension[i]) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+int
+isarrayref(struct type t)
+{
+	return t.dimension[0] > 0;
+}
+
+int
 isunsigned(struct type t)
 {
-	return t.tag == U32T || t.tag == U64T;
+	return !isarrayref(t) && (t.tag == U32T || t.tag == U64T);
 }
 
 int
 isfloat(struct type t)
 {
-	return t.tag == F32T || t.tag == F64T;
+	return !isarrayref(t) && (t.tag == F32T || t.tag == F64T);
 }
 
 void
@@ -875,7 +879,7 @@ storei8(int ptr, int idx, char i8)
 }
 
 int
-call(struct function *fn, int nargs, struct expressionresult2 *args,
+call(struct function *fn, int nargs, struct expressionresult *args,
 		int returnsvalue)
 {
 	int i, result;
@@ -894,7 +898,7 @@ call(struct function *fn, int nargs, struct expressionresult2 *args,
 		if (i != 0) {
 			printf(", ");
 		}
-		if (args[i].isarray) {
+		if (isarrayref(args[i].t)) {
 			printf("ptr %%tmp%d", args[i].var);
 		} else {
 			printf("%s %%tmp%d", args[i].t.lltype, args[i].var);

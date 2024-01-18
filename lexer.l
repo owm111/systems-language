@@ -32,6 +32,7 @@ static char *strlitptr;
 "u64" return U64;
 "f32" return F32;
 "f64" return F64;
+"ref" return REF;
 
 "cast" return CAST;
 "printf" return PRINTF;
