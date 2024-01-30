@@ -3,10 +3,12 @@ CPPFLAGS = -D_POSIX_C_SOURCE=200809L -DYYDEBUG=1
 LFLAGS =
 YFLAGS = -d -v
 
-all: compiler
+test-programs = test-program sort-test
+
+all: compiler $(test-programs)
 
 clean:
-	$(RM) compiler *.o y.* compiler.c lexer.c
+	$(RM) compiler *.o y.* compiler.c lexer.c $(test-programs) *.ll
 
 .PHONY: all clean
 
